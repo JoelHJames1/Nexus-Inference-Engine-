@@ -44,6 +44,7 @@ struct HybridModel::Impl {
     float* token_embeddings = nullptr;   // [vocab_size, hidden_dim]
     float* output_norm = nullptr;        // [hidden_dim]
     float* output_weight = nullptr;      // [vocab_size, hidden_dim]
+    HybridLayerWeights::RawWeight output_weight_raw;  // Raw INT4 for fused GPU logits
 
     // Scratch buffers for intermediate activations
     float* hidden_state = nullptr;       // [hidden_dim]
@@ -94,6 +95,18 @@ struct HybridModel::Impl {
     // Load tensor and also store raw INT4 pointer for fused GPU path
     float* load_tensor_raw(const char* name, HybridLayerWeights::RawWeight& raw,
                            std::vector<int64_t>* shape_out = nullptr);
+
+    // Fused GEMM: uses INT4 GPU path if raw data available, else FP32 GEMM
+    void fused_gemm(const float* input, const float* weight,
+                    const HybridLayerWeights::RawWeight& raw,
+                    float* output, int M, int N, int K) {
+        if (raw.data && raw.bytes > 0) {
+            compute::global_compute().gemm_int4(input, raw.data, raw.bytes,
+                                                 output, M, N, K);
+        } else if (weight) {
+            compute::global_compute().gemm(input, weight, output, M, N, K);
+        }
+    }
 
     // ─── Tensor loading helpers ───────────────────────────────────────────
     /// Load a tensor by name, returning the mapped pointer and optionally
@@ -499,8 +512,8 @@ int32_t HybridModel::decode_step(const SamplingParams& params) {
 
     // Compute logits: hidden_state @ output_weight^T -> logits
     if (m.output_weight) {
-        compute::global_compute().gemm(m.hidden_state, m.output_weight, m.logits,
-                         1, m.manifest.vocab_size, m.manifest.hidden_dim);
+        m.fused_gemm(m.hidden_state, m.output_weight, m.output_weight_raw,
+                     m.logits, 1, m.manifest.vocab_size, m.manifest.hidden_dim);
     }
 
     int32_t next_token = m.sample_token(m.logits, params);
@@ -559,15 +572,7 @@ void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
     // attn_qkv: [hidden_dim, qkv_out_dim] — single matmul
     int qkv_dim = lw.qkv_out_dim;
     if (lw.attn_qkv && qkv_dim > 0) {
-        // Try fused INT4 GPU path first (zero-copy UMA, ~8x faster)
-        if (lw.attn_qkv_raw.data && lw.attn_qkv_raw.bytes > 0) {
-            compute::global_compute().gemm_int4(norm_buf, lw.attn_qkv_raw.data,
-                                                 lw.attn_qkv_raw.bytes, qkv_buf,
-                                                 1, qkv_dim, dim);
-        } else {
-            compute::global_compute().gemm(norm_buf, lw.attn_qkv, qkv_buf,
-                                            1, qkv_dim, dim);
-        }
+        fused_gemm(norm_buf, lw.attn_qkv, lw.attn_qkv_raw, qkv_buf, 1, qkv_dim, dim);
     } else {
         // No QKV weights — zero out and skip attention
         memset(qkv_buf, 0, dim * sizeof(float));
@@ -654,8 +659,7 @@ void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
             // ssm_out: [ssm_out_dim, hidden_dim]
             // We project attn_output (ssm_out_dim) -> hidden_dim
             int in_dim = lw.ssm_out_dim;
-            compute::global_compute().gemm(attn_output, lw.ssm_out, ffn_output,
-                             1, dim, in_dim);
+            fused_gemm(attn_output, lw.ssm_out, lw.ssm_out_raw, ffn_output, 1, dim, in_dim);
             memcpy(attn_output, ffn_output, dim * sizeof(float));
         }
 
@@ -665,8 +669,7 @@ void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
         if (lw.attn_gate && lw.gate_out_dim > 0) {
             // Compute gate: norm_buf @ attn_gate -> gate values
             std::vector<float> gate_vals(lw.gate_out_dim);
-            compute::global_compute().gemm(norm_buf, lw.attn_gate, gate_vals.data(),
-                             1, lw.gate_out_dim, dim);
+            fused_gemm(norm_buf, lw.attn_gate, lw.attn_gate_raw, gate_vals.data(), 1, lw.gate_out_dim, dim);
             // Apply sigmoid gate element-wise (up to min of gate_dim and dim)
             int gate_dim = std::min(lw.gate_out_dim, dim);
             for (int i = 0; i < gate_dim; i++) {
@@ -727,9 +730,9 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
     std::vector<float> k(k_dim, 0.0f);
     std::vector<float> v(v_dim, 0.0f);
 
-    if (lw.wq) compute::global_compute().gemm(norm_buf, lw.wq, q.data(), 1, q_dim, dim);
-    if (lw.wk) compute::global_compute().gemm(norm_buf, lw.wk, k.data(), 1, k_dim, dim);
-    if (lw.wv) compute::global_compute().gemm(norm_buf, lw.wv, v.data(), 1, v_dim, dim);
+    if (lw.wq) fused_gemm(norm_buf, lw.wq, lw.wq_raw, q.data(), 1, q_dim, dim);
+    if (lw.wk) fused_gemm(norm_buf, lw.wk, lw.wk_raw, k.data(), 1, k_dim, dim);
+    if (lw.wv) fused_gemm(norm_buf, lw.wv, lw.wv_raw, v.data(), 1, v_dim, dim);
 
     // ── Apply Q/K RMSNorm if present ──
     // Q norm and K norm are applied per-head. The norm weight dimension tells
@@ -799,8 +802,7 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
         // Determine wo input dimension from tensor shape
         int wo_in_dim = n_heads * head_dim;  // 16 * 256 = 4096
         if (wo_in_dim <= 0) wo_in_dim = q_dim;  // fallback
-        compute::global_compute().gemm(attn_output, lw.wo, ffn_output,
-                         1, dim, wo_in_dim);
+        fused_gemm(attn_output, lw.wo, lw.wo_raw, ffn_output, 1, dim, wo_in_dim);
         memcpy(attn_output, ffn_output, dim * sizeof(float));
     } else {
         // No output projection — truncate/pad to hidden_dim
@@ -968,7 +970,7 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
 
     // ── Compute gate logits: x @ moe_gate -> [num_experts] ──
     std::vector<float> gate_logits(num_experts);
-    compute::global_compute().gemm(x, lw.moe_gate, gate_logits.data(),
+    fused_gemm(x, lw.moe_gate, lw.moe_gate_raw, gate_logits.data(),
                      1, num_experts, dim);
 
     // ── Softmax over gate logits ──
@@ -1117,6 +1119,15 @@ bool HybridModel::Impl::load_layer_weights(uint32_t layer_idx) {
         return ptr != nullptr;
     };
 
+    // Load with raw INT4 pointer for fused GPU path
+    auto load_raw = [&](const char* suffix, float*& ptr,
+                        HybridLayerWeights::RawWeight& raw,
+                        std::vector<int64_t>* shape = nullptr) -> bool {
+        std::string name = layer_tensor_name(layer_idx, suffix);
+        ptr = load_tensor_raw(name.c_str(), raw, shape);
+        return ptr != nullptr;
+    };
+
     // ── Shared norms ──
     load("attention_norm.weight", lw.attention_norm);
     load("post_attention_norm.weight", lw.post_attention_norm);
@@ -1128,7 +1139,7 @@ bool HybridModel::Impl::load_layer_weights(uint32_t layer_idx) {
     // where we know which experts are active.
     {
         std::vector<int64_t> gate_shape;
-        load("feed_forward.gate.weight", lw.moe_gate, &gate_shape);
+        load_raw("feed_forward.gate.weight", lw.moe_gate, lw.moe_gate_raw, &gate_shape);
         if (lw.moe_gate && gate_shape.size() >= 2) {
             int d0 = static_cast<int>(gate_shape[0]);
             int d1 = static_cast<int>(gate_shape[1]);
@@ -1187,14 +1198,14 @@ bool HybridModel::Impl::load_layer_weights(uint32_t layer_idx) {
 
         // Attn gate
         std::vector<int64_t> gate_shape;
-        load("attn_gate.weight", lw.attn_gate, &gate_shape);
+        load_raw("attn_gate.weight", lw.attn_gate, lw.attn_gate_raw, &gate_shape);
         if (lw.attn_gate && gate_shape.size() >= 2) {
             lw.gate_out_dim = static_cast<int>(gate_shape[1]);
         }
 
         // SSM output projection
         std::vector<int64_t> ssm_out_shape;
-        load("ssm_out.weight", lw.ssm_out, &ssm_out_shape);
+        load_raw("ssm_out.weight", lw.ssm_out, lw.ssm_out_raw, &ssm_out_shape);
         if (lw.ssm_out && ssm_out_shape.size() >= 2) {
             lw.ssm_out_dim = static_cast<int>(ssm_out_shape[0]);
         }
@@ -1239,12 +1250,12 @@ bool HybridModel::Impl::load_layer_weights(uint32_t layer_idx) {
         }
 
     } else if (lw.type == HybridLayerType::Attention_MoE) {
-        // Separate Q/K/V/O projections
+        // Separate Q/K/V/O projections — with raw INT4 for GPU fused path
         std::vector<int64_t> q_shape, k_shape, v_shape;
-        load("attention.wq.weight", lw.wq, &q_shape);
-        load("attention.wk.weight", lw.wk, &k_shape);
-        load("attention.wv.weight", lw.wv, &v_shape);
-        load("attention.wo.weight", lw.wo);
+        load_raw("attention.wq.weight", lw.wq, lw.wq_raw, &q_shape);
+        load_raw("attention.wk.weight", lw.wk, lw.wk_raw, &k_shape);
+        load_raw("attention.wv.weight", lw.wv, lw.wv_raw, &v_shape);
+        load_raw("attention.wo.weight", lw.wo, lw.wo_raw);
 
         if (lw.wq && q_shape.size() >= 2) lw.q_out_dim = static_cast<int>(q_shape[1]);
         if (lw.wk && k_shape.size() >= 2) lw.k_out_dim = static_cast<int>(k_shape[1]);
@@ -1312,7 +1323,7 @@ bool HybridModel::Impl::load_embedding_weights() {
     current_loading_layer = UINT32_MAX;
     token_embeddings = load_tensor("tok_embeddings.weight");
     output_norm = load_tensor("norm.weight");
-    output_weight = load_tensor("output.weight");
+    output_weight = load_tensor_raw("output.weight", output_weight_raw);
     current_loading_layer = 0;
     return token_embeddings != nullptr;
 }

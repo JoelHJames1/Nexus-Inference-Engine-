@@ -83,8 +83,11 @@ struct HybridLayerWeights {
         size_t bytes = 0;
     };
     RawWeight attn_qkv_raw;              // Raw INT4 for fused QKV
+    RawWeight attn_gate_raw;             // Raw INT4 for attn gate
+    RawWeight ssm_out_raw;               // Raw INT4 for SSM output projection
     RawWeight wq_raw, wk_raw, wv_raw, wo_raw;  // Raw INT4 for separate attention
     RawWeight moe_gate_raw;              // Raw INT4 for router gate
+    RawWeight output_weight_raw;         // Raw INT4 for final output projection
 
     // Shape metadata read from tensor info (stored per-layer for flexibility)
     int qkv_out_dim = 0;                 // Output dimension of fused QKV
