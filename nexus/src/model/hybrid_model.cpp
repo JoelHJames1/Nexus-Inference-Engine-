@@ -482,32 +482,15 @@ std::unique_ptr<HybridModel> HybridModel::create(
                 m.load_layer_weights(i);
             }
 
-            // Pre-wrap all raw INT4 weight pointers as MTLBuffers via gemm_int4's
-            // internal cache. We do this by triggering a cache lookup for every
-            // raw weight pointer. The wrapped_buffer_cache_ in ComputeDispatch
-            // will hold them permanently.
-            auto& gpu = compute::global_compute();
-            auto pre_wrap = [&](const void* data, size_t bytes) {
-                if (data && bytes > 0) {
-                    // gemm_int4 with M=0 would be a no-op, so instead we just
-                    // call gemm_int4 internals via the existing cache path.
-                    // The simplest way: do a dummy gemm_int4 that triggers
-                    // wrap_pointer caching. But that's wasteful.
-                    // Instead, directly trigger the cache by calling gemm_int4
-                    // with trivial dimensions — the buffer gets cached on first use.
-                    // Actually, the buffers will be cached on first real use per-layer,
-                    // which is fine since all layers are loaded. Let's just call
-                    // preload_all_buffers() after the first full pass.
-                    (void)data; (void)bytes;
-                }
-            };
-
-            // The wrapped_buffer_cache_ gets populated on first gemm_int4 call
-            // per weight pointer. Since all layer weights are loaded, the first
-            // token pass will populate the cache. After that, every subsequent
-            // token reuses the cached MTLBuffers with zero overhead.
+            // The wrapped_buffer_cache_ in ComputeDispatch gets populated on
+            // first gemm_int4 call per weight pointer during the first token.
+            // Since all layer weights are now loaded, that first pass populates
+            // the cache. Every subsequent token reuses cached MTLBuffers with
+            // zero overhead. preload_all_buffers() is called after prefill to
+            // fault all pages into physical RAM.
             //
             // Pre-allocate activation buffers to max size to avoid per-token realloc.
+            auto& gpu = compute::global_compute();
             size_t max_act_bytes = static_cast<size_t>(1) * std::max(m.max_qkv_dim, (int)manifest.hidden_dim) * sizeof(float);
             size_t max_out_bytes = static_cast<size_t>(std::max((int)manifest.vocab_size, m.max_qkv_dim)) * sizeof(float);
             gpu.pre_allocate_activation_buffer(max_act_bytes, max_out_bytes);
@@ -553,6 +536,13 @@ void HybridModel::prefill(const std::vector<int32_t>& tokens) {
         });
 
         m.current_seq_len++;
+    }
+
+    // In resident mode, after the first full pass all weight MTLBuffers are
+    // cached. Fault every page into physical RAM so decode tokens pay zero
+    // page-fault cost.
+    if (m.resident_mode) {
+        compute::global_compute().preload_all_buffers();
     }
 
     fprintf(stderr, "[nexus] Prefill complete: %d tokens, seq_len=%d\n",
@@ -1324,6 +1314,9 @@ bool HybridModel::Impl::load_layer_weights(uint32_t layer_idx) {
 }
 
 void HybridModel::Impl::evict_layer_weights(uint32_t layer_idx) {
+    // In resident mode, weights stay loaded permanently — never evict.
+    if (resident_mode) return;
+
     auto& lw = layer_weights[layer_idx];
     // Mark this layer's dequant buffers as available for reuse.
     // Don't actually free (munmap) — just clear the tracking so

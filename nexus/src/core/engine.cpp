@@ -12,16 +12,10 @@
 
 namespace nexus {
 
-/// Returns true if the architecture string indicates a hybrid SSM+Attention model
-/// that should use HybridModel instead of the standard Transformer.
-static bool is_hybrid_architecture(const std::string& arch) {
-    return arch == "qwen3next"
-        || arch == "qwen3_coder_next"
-        || arch == "qwen3-coder-next"
-        || arch == "Qwen3-Coder-Next"
-        || arch == "hybrid_ssm_attention"
-        || arch == "hybrid_deltanet_moe"
-        || arch.find("qwen3") != std::string::npos;
+/// All models now use HybridModel which has the INT4 dequant bridge,
+/// fused GPU GEMV, resident mode, and handles both dense and hybrid architectures.
+static bool is_hybrid_architecture(const std::string& /*arch*/) {
+    return true;  // HybridModel handles everything
 }
 
 struct Engine::Impl {
@@ -166,8 +160,8 @@ std::string Engine::generate(const std::string& prompt,
             next_token = impl_->model->decode_step(params);
         }
 
-        // Check for EOS
-        if (next_token <= 0) break;
+        // Check for EOS (token -1 = error, EOS token varies by model)
+        if (next_token < 0) break;
 
         std::string token_str = detokenize({next_token});
         output += token_str;
