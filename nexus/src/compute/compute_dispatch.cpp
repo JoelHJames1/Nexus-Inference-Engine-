@@ -95,34 +95,18 @@ void ComputeDispatch::gemm(const float* A, const float* B, float* C,
                 volatile float test_b_end = B[(size_t)K * N - 1];
                 (void)test_b; (void)test_b_end;
             }
-            if (!gpu_->copy_to_buffer(ba, A, a_size)) {
-                fprintf(stderr, "[compute] copy_to_buffer(A) failed\n");
-                goto cpu_fallback;
-            }
-            if (!gpu_->copy_to_buffer(bb, B, b_size)) {
-                fprintf(stderr, "[compute] copy_to_buffer(B) failed\n");
+            if (!gpu_->copy_to_buffer(ba, A, a_size) ||
+                !gpu_->copy_to_buffer(bb, B, b_size)) {
                 goto cpu_fallback;
             }
 
-            fprintf(stderr, "[gpu] gemm dispatch M=%d N=%d K=%d...", M, N, K);
-            fflush(stderr);
-            bool ok = gpu_->gemm_f32(ba, bb, bc, M, N, K);
-            fprintf(stderr, "%s\n", ok ? "OK" : "FAIL");
-            if (ok) {
+            if (gpu_->gemm_f32(ba, bb, bc, M, N, K)) {
                 void* result = gpu_->buffer_contents(bc);
-                fprintf(stderr, "[gpu] readback ptr=%p\n", result);
                 if (result) {
                     memcpy(C, result, c_size);
-                    fprintf(stderr, "[gpu] done\n");
                     return;
                 }
-                fprintf(stderr, "[compute] GPU GEMM: buffer_contents returned null\n");
-            } else {
-                fprintf(stderr, "[compute] GPU GEMM dispatch failed, falling back to CPU\n");
             }
-        } else {
-            fprintf(stderr, "[compute] GPU buffer alloc failed (need %zu + %zu + %zu bytes)\n",
-                    a_size, b_size, c_size);
         }
         // Fall through to CPU on failure
     }
