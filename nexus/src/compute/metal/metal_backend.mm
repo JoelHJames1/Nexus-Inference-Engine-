@@ -180,6 +180,40 @@ bool MetalBackend::gemv_dequant_int4(buffer_id buf_activations,
     return true;
 }
 
+// ─── Fused INT4 Uniform GEMV ────────────────────────────────────────────────
+
+bool MetalBackend::gemv_int4_uniform(buffer_id buf_activations,
+                                      buffer_id buf_weights_q,
+                                      buffer_id buf_output,
+                                      uint32_t N, uint32_t K)
+{
+    if (!is_ready()) return false;
+
+    id<MTLComputePipelineState> pso = impl_->pipeline("gemv_int4_uniform");
+    if (!pso) return false;
+
+    auto [cb, enc] = impl_->begin_compute();
+    if (!enc) return false;
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:handle_to_buffer(buf_activations) offset:0 atIndex:0];
+    [enc setBuffer:handle_to_buffer(buf_weights_q) offset:0 atIndex:1];
+    [enc setBuffer:handle_to_buffer(buf_output) offset:0 atIndex:2];
+
+    // Params struct matching the shader
+    struct { uint32_t N; uint32_t K; } params = { N, K };
+    [enc setBytes:&params length:sizeof(params) atIndex:3];
+
+    // 1D dispatch: one thread per output column
+    NSUInteger tg = threadgroup_1d(pso);
+    MTLSize threadgroup_size = MTLSizeMake(tg, 1, 1);
+    MTLSize grid_size = MTLSizeMake((N + tg - 1) / tg, 1, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:threadgroup_size];
+
+    impl_->end_compute(cb, enc);
+    return true;
+}
+
 // ─── RMSNorm ────────────────────────────────────────────────────────────────
 
 bool MetalBackend::rmsnorm(buffer_id buf_input, buffer_id buf_weight,

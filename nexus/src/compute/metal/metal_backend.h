@@ -56,6 +56,12 @@ public:
                            uint32_t M, uint32_t N, uint32_t K,
                            uint32_t group_size);
 
+    /// Fused INT4 uniform dequant + GEMV (no scales/zeros).
+    /// Maps nibbles via (nibble - 8) * 0.125. Fastest path for NXF INT4 data.
+    bool gemv_int4_uniform(buffer_id buf_activations, buffer_id buf_weights_q,
+                           buffer_id buf_output,
+                           uint32_t N, uint32_t K);
+
     // ─── Normalization ─────────────────────────────────────────────────────
 
     /// RMSNorm:  output = input * weight / sqrt(mean(input^2) + eps)
