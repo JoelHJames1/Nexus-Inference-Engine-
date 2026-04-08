@@ -1251,12 +1251,16 @@ attn_moe_cpu_ffn_fallback:
         if (false) {
             // placeholder
         } else {
-            // Fallback: separate RMSNorm + individual GEMVs
+            // RMSNorm on CPU (fast for small dim, avoids dispatch)
             if (lw.attention_norm) {
                 gpu.rmsnorm(norm_buf, x, lw.attention_norm, dim, manifest.rms_norm_eps);
             } else {
                 memcpy(norm_buf, x, dim * sizeof(float));
             }
+
+            // Individual GEMVs — each uses gemm_int4 with cached buffers.
+            // Batching QKV into one commit was tested but SLOWER (3.1 vs 6.7)
+            // because upload/download overhead exceeds the commit() savings on UMA.
             if (lw.wq) fused_gemm(norm_buf, lw.wq, lw.wq_raw, q.data(), 1, q_dim, dim);
             if (lw.wk) fused_gemm(norm_buf, lw.wk, lw.wk_raw, k.data(), 1, k_dim, dim);
             if (lw.wv) fused_gemm(norm_buf, lw.wv, lw.wv_raw, v.data(), 1, v_dim, dim);
