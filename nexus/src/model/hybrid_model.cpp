@@ -1001,7 +1001,24 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
             gate_logits[expert_indices[i]] / active_sum : 1.0f / num_active;
     }
 
-    // ── On-demand expert weight slicing and execution (fused INT4 GPU path) ──
+    // ── Batched expert execution: ONE GPU dispatch for all 10 experts ──
+    // Instead of 30 separate dispatches (10 experts × 3 GEMMs each),
+    // send everything to the batched_expert_swiglu shader.
+    {
+        std::vector<int> active_ids(num_active);
+        for (int i = 0; i < num_active; i++) active_ids[i] = expert_indices[i];
+
+        compute::global_compute().batched_moe_ffn(
+            x, dim, expert_ffn,
+            active_ids.data(), expert_weights.data(), num_active, num_experts,
+            lw.expert_w1_raw, lw.expert_w1_bytes,
+            lw.expert_w2_raw, lw.expert_w2_bytes,
+            lw.expert_w3_raw, lw.expert_w3_bytes,
+            out);
+        return;
+    }
+
+    // ── Fallback: per-expert execution (kept for reference) ──
     // Expert weight tensors are stored as single INT4-packed NXF chunks:
     //   w1: [num_experts, hidden_dim, expert_ffn_dim] — gate projection
     //   w2: [num_experts, expert_ffn_dim, hidden_dim] — down projection

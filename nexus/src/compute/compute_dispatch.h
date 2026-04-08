@@ -73,6 +73,21 @@ public:
     /// Softmax in-place over dim elements
     void softmax(float* data, int dim);
 
+    // ─── Batched MoE expert execution ─────────────────────────────────
+
+    /// Execute all active experts' SwiGLU FFN in ONE GPU dispatch.
+    /// expert_ids: array of active expert indices
+    /// gate_weights: corresponding gate scores (normalized)
+    /// w1/w2/w3_raw: full packed INT4 expert weight tensors
+    /// output: accumulated weighted result [hidden_dim]
+    void batched_moe_ffn(const float* activations, int hidden_dim, int expert_ffn_dim,
+                         const int* expert_ids, const float* gate_weights, int num_active,
+                         int num_experts,
+                         const void* w1_raw, size_t w1_bytes,
+                         const void* w2_raw, size_t w2_bytes,
+                         const void* w3_raw, size_t w3_bytes,
+                         float* output);
+
     // ─── Batch mode (command buffer pipelining) ────────────────────────
 
     /// Begin a GPU batch: all subsequent GPU dispatches share a single

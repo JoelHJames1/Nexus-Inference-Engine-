@@ -105,6 +105,16 @@ public:
     /// Release a buffer previously allocated with alloc_shared_buffer.
     void free_buffer(buffer_id buffer_handle);
 
+    // ─── Batched MoE expert GEMV ────────────────────────────────────────────
+
+    /// Execute all active experts' SwiGLU in ONE dispatch.
+    bool batched_expert_ffn(buffer_id buf_activations,
+                            buffer_id buf_w1, buffer_id buf_w3, buffer_id buf_w2,
+                            buffer_id buf_expert_ids, buffer_id buf_gate_weights,
+                            buffer_id buf_output,
+                            uint32_t hidden_dim, uint32_t expert_ffn_dim,
+                            uint32_t num_active, uint32_t num_experts);
+
     // ─── Command buffer pipelining (batch mode) ───────────────────────────
 
     /// Begin a batch: create a single command buffer + encoder that will be

@@ -166,6 +166,8 @@ set(METAL_SHADERS
     shaders/rmsnorm.metal
     shaders/activations.metal
     shaders/gemv_int4_uniform.metal
+    shaders/gemv_int4_fast.metal
+    shaders/batched_expert_gemv.metal
 )
 
 set(METAL_AIR_FILES "")

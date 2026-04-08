@@ -242,7 +242,12 @@ bool MetalBackend::gemv_int4_uniform(buffer_id buf_activations,
 {
     if (!is_ready()) return false;
 
-    id<MTLComputePipelineState> pso = impl_->pipeline("gemv_int4_uniform");
+    // Use the fast SIMD-cooperative GEMV shader (coalesced reads, simd_sum reduction)
+    id<MTLComputePipelineState> pso = impl_->pipeline("gemv_int4_fast");
+    if (!pso) {
+        // Fall back to uniform shader if fast shader not compiled
+        pso = impl_->pipeline("gemv_int4_uniform");
+    }
     if (!pso) return false;
 
     auto [cb, enc] = impl_->begin_compute();
@@ -257,10 +262,13 @@ bool MetalBackend::gemv_int4_uniform(buffer_id buf_activations,
     struct { uint32_t N; uint32_t K; } params = { N, K };
     [enc setBytes:&params length:sizeof(params) atIndex:3];
 
-    // 1D dispatch: one thread per output column
-    NSUInteger tg = threadgroup_1d(pso);
-    MTLSize threadgroup_size = MTLSizeMake(tg, 1, 1);
-    MTLSize grid_size = MTLSizeMake((N + tg - 1) / tg, 1, 1);
+    // Fast GEMV: 256 threads per threadgroup = 8 SIMD groups of 32.
+    // Each SIMD group computes one output element via cooperative reduction.
+    // So each threadgroup handles 8 output columns.
+    constexpr uint32_t TG_SIZE = 256;
+    constexpr uint32_t SIMDS = TG_SIZE / 32;  // 8
+    MTLSize threadgroup_size = MTLSizeMake(TG_SIZE, 1, 1);
+    MTLSize grid_size = MTLSizeMake((N + SIMDS - 1) / SIMDS, 1, 1);
     [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:threadgroup_size];
 
     impl_->end_compute(cb, enc);
@@ -428,6 +436,50 @@ MetalBackend::buffer_id MetalBackend::alloc_shared_buffer(size_t bytes)
     if (!buf) return 0;
     // Transfer ownership out via bridging cast.
     return reinterpret_cast<uint64_t>((__bridge_retained void*)buf);
+}
+
+// ─── Batched Expert FFN ─────────────────────────────────────────────────────
+
+bool MetalBackend::batched_expert_ffn(buffer_id buf_activations,
+                                       buffer_id buf_w1, buffer_id buf_w3, buffer_id buf_w2,
+                                       buffer_id buf_expert_ids, buffer_id buf_gate_weights,
+                                       buffer_id buf_output,
+                                       uint32_t hidden_dim, uint32_t expert_ffn_dim,
+                                       uint32_t num_active, uint32_t num_experts)
+{
+    if (!is_ready()) return false;
+
+    id<MTLComputePipelineState> pso = impl_->pipeline("batched_expert_gemv");
+    if (!pso) return false;
+
+    auto [cb, enc] = impl_->begin_compute();
+    if (!enc) return false;
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:handle_to_buffer(buf_activations) offset:0 atIndex:0];
+    [enc setBuffer:handle_to_buffer(buf_w1) offset:0 atIndex:1];
+    [enc setBuffer:handle_to_buffer(buf_w3) offset:0 atIndex:2];
+    [enc setBuffer:handle_to_buffer(buf_w2) offset:0 atIndex:3];
+    [enc setBuffer:handle_to_buffer(buf_expert_ids) offset:0 atIndex:4];
+    [enc setBuffer:handle_to_buffer(buf_gate_weights) offset:0 atIndex:5];
+    [enc setBuffer:handle_to_buffer(buf_output) offset:0 atIndex:6];
+
+    struct {
+        uint32_t hidden_dim;
+        uint32_t expert_ffn_dim;
+        uint32_t num_active;
+        uint32_t num_experts;
+    } params = { hidden_dim, expert_ffn_dim, num_active, num_experts };
+    [enc setBytes:&params length:sizeof(params) atIndex:7];
+
+    // One threadgroup per active expert
+    NSUInteger tg = std::min<NSUInteger>([pso maxTotalThreadsPerThreadgroup], 256);
+    MTLSize threadgroup_size = MTLSizeMake(tg, 1, 1);
+    MTLSize grid_size = MTLSizeMake(num_active, 1, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:threadgroup_size];
+
+    impl_->end_compute(cb, enc);
+    return true;
 }
 
 MetalBackend::buffer_id MetalBackend::wrap_pointer(void* ptr, size_t bytes)

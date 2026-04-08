@@ -199,6 +199,74 @@ void ComputeDispatch::gemv_int4(float* out, const float* activations,
                       out, M, N, K, false, false);
 }
 
+// ─── Batched MoE FFN (single dispatch for all experts) ──────────────────────
+
+void ComputeDispatch::batched_moe_ffn(
+    const float* activations, int hidden_dim, int expert_ffn_dim,
+    const int* expert_ids, const float* gate_weights, int num_active,
+    int num_experts,
+    const void* w1_raw, size_t w1_bytes,
+    const void* w2_raw, size_t w2_bytes,
+    const void* w3_raw, size_t w3_bytes,
+    float* output)
+{
+    if (!gpu_ready_) {
+        memset(output, 0, hidden_dim * sizeof(float));
+        return;
+    }
+
+    // Wrap or get cached buffers for expert weight tensors
+    auto get_cached = [&](const void* ptr, size_t bytes) -> MetalBackend::buffer_id {
+        auto it = wrapped_buffer_cache_.find(ptr);
+        if (it != wrapped_buffer_cache_.end()) return it->second;
+        auto buf = gpu_->wrap_pointer(const_cast<void*>(ptr), bytes);
+        if (buf) wrapped_buffer_cache_[ptr] = buf;
+        return buf;
+    };
+
+    auto buf_w1 = get_cached(w1_raw, w1_bytes);
+    auto buf_w2 = get_cached(w2_raw, w2_bytes);
+    auto buf_w3 = get_cached(w3_raw, w3_bytes);
+
+    size_t act_size = hidden_dim * sizeof(float);
+    size_t out_size = hidden_dim * sizeof(float);
+    size_t ids_size = num_active * sizeof(int);
+    size_t gw_size = num_active * sizeof(float);
+
+    auto buf_act = ensure_buffer(buf_a_, act_size);
+    auto buf_out = ensure_buffer(buf_c_, out_size);
+
+    // Small buffers for expert IDs and gate weights
+    auto buf_ids = gpu_->alloc_shared_buffer(ids_size);
+    auto buf_gw = gpu_->alloc_shared_buffer(gw_size);
+
+    if (buf_w1 && buf_w2 && buf_w3 && buf_act && buf_out && buf_ids && buf_gw) {
+        gpu_->copy_to_buffer(buf_act, activations, act_size);
+        gpu_->copy_to_buffer(buf_ids, expert_ids, ids_size);
+        gpu_->copy_to_buffer(buf_gw, gate_weights, gw_size);
+        // Zero output buffer
+        memset(gpu_->buffer_contents(buf_out), 0, out_size);
+
+        if (gpu_->batched_expert_ffn(buf_act, buf_w1, buf_w3, buf_w2,
+                                      buf_ids, buf_gw, buf_out,
+                                      hidden_dim, expert_ffn_dim,
+                                      num_active, num_experts)) {
+            void* result = gpu_->buffer_contents(buf_out);
+            if (result) {
+                memcpy(output, result, out_size);
+                gpu_->free_buffer(buf_ids);
+                gpu_->free_buffer(buf_gw);
+                return;
+            }
+        }
+    }
+    if (buf_ids) gpu_->free_buffer(buf_ids);
+    if (buf_gw) gpu_->free_buffer(buf_gw);
+
+    // Fallback: zero output
+    memset(output, 0, hidden_dim * sizeof(float));
+}
+
 // ─── Element-wise ops ───────────────────────────────────────────────────────
 
 void ComputeDispatch::rmsnorm(float* out, const float* x, const float* weight,
