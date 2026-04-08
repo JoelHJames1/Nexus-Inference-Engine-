@@ -105,6 +105,22 @@ public:
     /// Release a buffer previously allocated with alloc_shared_buffer.
     void free_buffer(buffer_id buffer_handle);
 
+    // ─── Command buffer pipelining (batch mode) ───────────────────────────
+
+    /// Begin a batch: create a single command buffer + encoder that will be
+    /// reused across multiple dispatches.  While a batch is active,
+    /// begin_compute()/end_compute() inside each operation will reuse the
+    /// persistent encoder and insert memory barriers instead of
+    /// commit+wait.
+    void begin_batch();
+
+    /// End the current batch: commit the command buffer and wait for all
+    /// dispatched work to complete.  Must be paired with begin_batch().
+    void end_batch();
+
+    /// Returns true if a batch is currently active.
+    bool in_batch() const;
+
 private:
     std::unique_ptr<MetalBackendImpl> impl_;
 };

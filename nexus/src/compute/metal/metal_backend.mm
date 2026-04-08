@@ -42,6 +42,11 @@ static inline uint32_t ceil_div(uint32_t a, uint32_t b) {
 struct MetalBackendImpl {
     MetalContext* ctx = nullptr;
 
+    // ── Persistent encoder state for batch mode ────────────────────────
+    bool persistent_mode = false;
+    id<MTLCommandBuffer> persistent_cb = nil;
+    id<MTLComputeCommandEncoder> persistent_enc = nil;
+
     explicit MetalBackendImpl(MetalContext& context) : ctx(&context) {}
 
     /// Convenience: get the context impl.
@@ -55,10 +60,51 @@ struct MetalBackendImpl {
         return pso;
     }
 
-    /// Create a command buffer + compute encoder pair.  Returns nil encoder
+    /// Begin a batch — create one command buffer + encoder that persists
+    /// across multiple dispatches.
+    void begin_batch() {
+        if (persistent_mode) return;  // Already in batch
+        auto* c = ci();
+        persistent_cb = c->make_command_buffer();
+        if (persistent_cb) {
+            persistent_enc = [persistent_cb computeCommandEncoder];
+            persistent_mode = true;
+        }
+    }
+
+    /// End the batch — commit and wait for all dispatched work.
+    void end_batch() {
+        if (!persistent_mode) return;
+        if (persistent_enc) {
+            [persistent_enc endEncoding];
+            persistent_enc = nil;
+        }
+        if (persistent_cb) {
+            [persistent_cb commit];
+            [persistent_cb waitUntilCompleted];
+            if (persistent_cb.status == MTLCommandBufferStatusError) {
+                NSError* err = persistent_cb.error;
+                fprintf(stderr, "[metal] Batch command buffer error: %s\n",
+                        err ? [[err localizedDescription] UTF8String] : "unknown");
+            }
+            persistent_cb = nil;
+        }
+        persistent_mode = false;
+    }
+
+    /// Create a command buffer + compute encoder pair.  In persistent mode,
+    /// returns the existing encoder (inserting a memory barrier for
+    /// correctness between dependent dispatches).  Returns nil encoder
     /// on failure.
     std::pair<id<MTLCommandBuffer>, id<MTLComputeCommandEncoder>>
     begin_compute() {
+        if (persistent_mode && persistent_enc) {
+            // Reuse the persistent encoder — insert a barrier so that the
+            // previous dispatch's writes are visible to the next dispatch.
+            [persistent_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            return {persistent_cb, persistent_enc};
+        }
+        // Non-batch mode: create a fresh command buffer + encoder.
         auto* c = ci();
         id<MTLCommandBuffer> cb = c->make_command_buffer();
         if (!cb) return {nil, nil};
@@ -66,9 +112,16 @@ struct MetalBackendImpl {
         return {cb, enc};
     }
 
-    /// End encode, commit, and wait.
+    /// End encode, commit, and wait.  In persistent mode, this is a no-op
+    /// (the batch's end_batch() handles the commit).
     void end_compute(id<MTLCommandBuffer> cb,
                      id<MTLComputeCommandEncoder> enc) {
+        if (persistent_mode) {
+            // Don't end encoding or commit — the batch owns the encoder.
+            // The memory barrier in the next begin_compute() ensures
+            // correct ordering between dependent dispatches.
+            return;
+        }
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -427,6 +480,23 @@ void MetalBackend::free_buffer(buffer_id buffer_handle)
     if (buffer_handle == 0) return;
     // Transfer ownership back to ARC, which will release immediately.
     (void)(__bridge_transfer id<MTLBuffer>)(void*)buffer_handle;
+}
+
+// ─── Command buffer pipelining (batch mode) ────────────────────────────────
+
+void MetalBackend::begin_batch()
+{
+    if (impl_) impl_->begin_batch();
+}
+
+void MetalBackend::end_batch()
+{
+    if (impl_) impl_->end_batch();
+}
+
+bool MetalBackend::in_batch() const
+{
+    return impl_ && impl_->persistent_mode;
 }
 
 }  // namespace nexus::compute

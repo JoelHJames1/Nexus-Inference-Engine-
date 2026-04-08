@@ -73,6 +73,21 @@ public:
     /// Softmax in-place over dim elements
     void softmax(float* data, int dim);
 
+    // ─── Batch mode (command buffer pipelining) ────────────────────────
+
+    /// Begin a GPU batch: all subsequent GPU dispatches share a single
+    /// command buffer. Call end_gpu_batch() when done to commit and wait.
+    void begin_gpu_batch();
+
+    /// End a GPU batch: commit the shared command buffer and synchronize.
+    void end_gpu_batch();
+
+    // ─── Buffer cache management ────────────────────────────────────────
+
+    /// Clear the wrapped-pointer buffer cache. Call when model weights are
+    /// unmapped or at shutdown.
+    void clear_buffer_cache();
+
 private:
     std::unique_ptr<MetalContext> ctx_;
     std::unique_ptr<MetalBackend> gpu_;
@@ -86,6 +101,11 @@ private:
     BufferCache buf_a_, buf_b_, buf_c_;
 
     MetalBackend::buffer_id ensure_buffer(BufferCache& cache, size_t needed);
+
+    // Cached wrapped-pointer MTLBuffers for mmap'd weight data.
+    // Avoids recreating MTLBuffers for the same persistent pointers
+    // across tokens (288 wrap_pointer + free_buffer calls per token).
+    std::unordered_map<const void*, MetalBackend::buffer_id> wrapped_buffer_cache_;
 };
 
 /// Global compute dispatcher (singleton-ish, set by Engine).

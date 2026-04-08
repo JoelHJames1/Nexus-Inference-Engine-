@@ -475,10 +475,10 @@ void HybridModel::prefill(const std::vector<int32_t>& tokens) {
         // Stream through all layers
         m.scheduler->execute_layers([&](uint32_t layer_idx) {
             m.load_layer_weights(layer_idx);
+            // Batch all GPU dispatches within this layer into one command buffer
+            compute::global_compute().begin_gpu_batch();
             m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
-            // Don't evict during streaming — let OS virtual memory handle paging.
-            // Each layer's dequant buffers (~128 MB) remain mapped but the OS
-            // will page out unused ones to swap as needed on Apple Silicon.
+            compute::global_compute().end_gpu_batch();
         });
 
         m.current_seq_len++;
@@ -961,13 +961,6 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
         return;
     }
 
-    // TODO: Debug expert slice offset calculation for INT4 packed 3D tensors.
-    // The byte offset E * dim * expert_ffn / 2 assumes row-major packing but
-    // the NXF converter may have flattened the tensor differently.
-    // Disabling expert execution until offset is verified.
-    // Gate logits are still computed above for routing analysis.
-    return;
-
     // ── Compute gate logits: x @ moe_gate -> [num_experts] ──
     std::vector<float> gate_logits(num_experts);
     fused_gemm(x, lw.moe_gate, lw.moe_gate_raw, gate_logits.data(),
@@ -1008,29 +1001,18 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
             gate_logits[expert_indices[i]] / active_sum : 1.0f / num_active;
     }
 
-    // ── On-demand expert weight slicing and execution ──
+    // ── On-demand expert weight slicing and execution (fused INT4 GPU path) ──
     // Expert weight tensors are stored as single INT4-packed NXF chunks:
     //   w1: [num_experts, hidden_dim, expert_ffn_dim] — gate projection
     //   w2: [num_experts, expert_ffn_dim, hidden_dim] — down projection
     //   w3: [num_experts, hidden_dim, expert_ffn_dim] — up projection
     //
-    // For expert E:
-    //   w1 slice: elements [E*dim*ffn .. (E+1)*dim*ffn), byte offset = E*dim*ffn/2
-    //   w2 slice: elements [E*ffn*dim .. (E+1)*ffn*dim), byte offset = E*ffn*dim/2
-    //   w3 slice: same layout as w1
-    //
-    // Each expert slice is ~1M elements = 500KB INT4 packed, dequants to 4MB FP32.
-    // With 10 active experts: 3 matrices * 4MB = 120MB total — very manageable.
+    // For expert E in INT4 packed format (2 elements per byte):
+    //   w1/w3 byte offset = E * dim * expert_ffn / 2  (each slice is [dim, expert_ffn])
+    //   w2 byte offset    = E * expert_ffn * dim / 2  (each slice is [expert_ffn, dim])
 
-    size_t w1_elem_stride = static_cast<size_t>(dim) * expert_ffn;    // elements per expert in w1/w3
-    size_t w2_elem_stride = static_cast<size_t>(expert_ffn) * dim;    // elements per expert in w2
-    size_t w1_byte_stride = w1_elem_stride / 2;   // INT4: 2 elements per byte
-    size_t w2_byte_stride = w2_elem_stride / 2;
-
-    // Allocate dequant buffers for one expert at a time (reused across experts)
-    std::vector<float> w1_dequant(w1_elem_stride);
-    std::vector<float> w2_dequant(w2_elem_stride);
-    std::vector<float> w3_dequant(w1_elem_stride);
+    size_t w13_slice_bytes = static_cast<size_t>(dim) * expert_ffn / 2;   // INT4 bytes per expert for w1/w3
+    size_t w2_slice_bytes  = static_cast<size_t>(expert_ffn) * dim / 2;   // INT4 bytes per expert for w2
 
     std::vector<float> gate_buf(expert_ffn);
     std::vector<float> up_buf(expert_ffn);
@@ -1041,52 +1023,36 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
         float weight = expert_weights[i];
 
         // ── Compute byte offsets for expert E's slice in packed INT4 data ──
-        size_t w1_byte_off = static_cast<size_t>(eid) * w1_byte_stride;
-        size_t w2_byte_off = static_cast<size_t>(eid) * w2_byte_stride;
-        size_t w3_byte_off = w1_byte_off;  // w3 has same layout as w1
+        size_t w13_byte_off = static_cast<size_t>(eid) * w13_slice_bytes;
+        size_t w2_byte_off  = static_cast<size_t>(eid) * w2_slice_bytes;
 
-        // Bounds check before dequant
-        if (w1_byte_off + w1_byte_stride > lw.expert_w1_bytes ||
-            w2_byte_off + w2_byte_stride > lw.expert_w2_bytes ||
-            w3_byte_off + w1_byte_stride > lw.expert_w3_bytes) {
+        // Bounds check before accessing raw INT4 data
+        if (w13_byte_off + w13_slice_bytes > lw.expert_w1_bytes ||
+            w2_byte_off  + w2_slice_bytes  > lw.expert_w2_bytes ||
+            w13_byte_off + w13_slice_bytes > lw.expert_w3_bytes) {
             fprintf(stderr, "[nexus] WARNING: expert %d slice out of bounds in layer %u, skipping\n",
                     eid, layer_idx);
             continue;
         }
 
-        // INT4 dequant for w1: each byte holds 2 elements (low nibble first)
-        {
-            const uint8_t* src = lw.expert_w1_raw + w1_byte_off;
-            for (size_t j = 0; j < w1_elem_stride; j += 2) {
-                uint8_t packed = src[j / 2];
-                w1_dequant[j]     = (static_cast<float>(packed & 0x0F) - 8.0f) / 8.0f;
-                w1_dequant[j + 1] = (static_cast<float>((packed >> 4) & 0x0F) - 8.0f) / 8.0f;
-            }
-        }
+        // Build RawWeight structs pointing to this expert's INT4 slices
+        HybridLayerWeights::RawWeight w1_slice_raw;
+        w1_slice_raw.data = lw.expert_w1_raw + w13_byte_off;
+        w1_slice_raw.bytes = w13_slice_bytes;
 
-        // INT4 dequant for w2
-        {
-            const uint8_t* src = lw.expert_w2_raw + w2_byte_off;
-            for (size_t j = 0; j < w2_elem_stride; j += 2) {
-                uint8_t packed = src[j / 2];
-                w2_dequant[j]     = (static_cast<float>(packed & 0x0F) - 8.0f) / 8.0f;
-                w2_dequant[j + 1] = (static_cast<float>((packed >> 4) & 0x0F) - 8.0f) / 8.0f;
-            }
-        }
+        HybridLayerWeights::RawWeight w3_slice_raw;
+        w3_slice_raw.data = lw.expert_w3_raw + w13_byte_off;
+        w3_slice_raw.bytes = w13_slice_bytes;
 
-        // INT4 dequant for w3
-        {
-            const uint8_t* src = lw.expert_w3_raw + w3_byte_off;
-            for (size_t j = 0; j < w1_elem_stride; j += 2) {
-                uint8_t packed = src[j / 2];
-                w3_dequant[j]     = (static_cast<float>(packed & 0x0F) - 8.0f) / 8.0f;
-                w3_dequant[j + 1] = (static_cast<float>((packed >> 4) & 0x0F) - 8.0f) / 8.0f;
-            }
-        }
+        HybridLayerWeights::RawWeight w2_slice_raw;
+        w2_slice_raw.data = lw.expert_w2_raw + w2_byte_off;
+        w2_slice_raw.bytes = w2_slice_bytes;
 
         // SwiGLU: out = (silu(x @ W1) * (x @ W3)) @ W2
-        compute::global_compute().gemm(x, w1_dequant.data(), gate_buf.data(), 1, expert_ffn, dim);
-        compute::global_compute().gemm(x, w3_dequant.data(), up_buf.data(), 1, expert_ffn, dim);
+        // Gate projection: x [1, dim] @ w1 [dim, expert_ffn] -> gate_buf [1, expert_ffn]
+        fused_gemm(x, nullptr, w1_slice_raw, gate_buf.data(), 1, expert_ffn, dim);
+        // Up projection: x [1, dim] @ w3 [dim, expert_ffn] -> up_buf [1, expert_ffn]
+        fused_gemm(x, nullptr, w3_slice_raw, up_buf.data(), 1, expert_ffn, dim);
 
         // SiLU on gate, elementwise multiply with up
         for (int j = 0; j < expert_ffn; j++) {
@@ -1094,9 +1060,8 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
             gate_buf[j] = s * up_buf[j];
         }
 
-        // Down projection
-        compute::global_compute().gemm(gate_buf.data(), w2_dequant.data(), expert_out.data(),
-                         1, dim, expert_ffn);
+        // Down projection: gate_buf [1, expert_ffn] @ w2 [expert_ffn, dim] -> expert_out [1, dim]
+        fused_gemm(gate_buf.data(), nullptr, w2_slice_raw, expert_out.data(), 1, dim, expert_ffn);
 
         // Weighted accumulation into output
         for (int j = 0; j < dim; j++) {

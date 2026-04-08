@@ -28,7 +28,11 @@ void set_global_compute(ComputeDispatch* dispatch) {
 // ─── Constructor / Destructor ───────────────────────────────────────────────
 
 ComputeDispatch::ComputeDispatch() = default;
-ComputeDispatch::~ComputeDispatch() = default;
+
+ComputeDispatch::~ComputeDispatch() {
+    // Clean up cached wrapped-pointer buffers before gpu_ is destroyed.
+    clear_buffer_cache();
+}
 
 bool ComputeDispatch::init_gpu(const std::string& shader_path) {
     ctx_ = std::make_unique<MetalContext>();
@@ -125,7 +129,20 @@ void ComputeDispatch::gemm_int4(const float* activations, const void* weights_in
     // UMA zero-copy GPU path: wrap mmap'd INT4 data as MTLBuffer, dispatch
     // fused dequant+GEMV shader. No CPU dequant, no allocation, no memcpy.
     if (gpu_ready_) {
-        auto buf_w = gpu_->wrap_pointer(const_cast<void*>(weights_int4), weights_bytes);
+        // ── Optimization 2: Cached weight buffers ──
+        // The same mmap'd weight pointers are reused across tokens.
+        // Cache the wrapped MTLBuffer to avoid 288 wrap+free round-trips/token.
+        MetalBackend::buffer_id buf_w;
+        auto it = wrapped_buffer_cache_.find(weights_int4);
+        if (it != wrapped_buffer_cache_.end()) {
+            buf_w = it->second;
+        } else {
+            buf_w = gpu_->wrap_pointer(const_cast<void*>(weights_int4), weights_bytes);
+            if (buf_w) {
+                wrapped_buffer_cache_[weights_int4] = buf_w;
+            }
+        }
+
         size_t act_size = static_cast<size_t>(M) * K * sizeof(float);
         size_t out_size = static_cast<size_t>(M) * N * sizeof(float);
         auto buf_a = ensure_buffer(buf_a_, act_size);
@@ -138,13 +155,11 @@ void ComputeDispatch::gemm_int4(const float* activations, const void* weights_in
                 void* result = gpu_->buffer_contents(buf_out);
                 if (result) {
                     memcpy(out, result, out_size);
-                    gpu_->free_buffer(buf_w);
+                    // Don't free buf_w — it's cached for reuse across tokens
                     return;
                 }
             }
-            gpu_->free_buffer(buf_w);
-        } else if (buf_w) {
-            gpu_->free_buffer(buf_w);
+            // Don't free buf_w — it's cached
         }
     }
 
@@ -215,6 +230,31 @@ void ComputeDispatch::softmax(float* data, int dim) {
     if (sum > 0.0f) {
         for (int i = 0; i < dim; i++) data[i] /= sum;
     }
+}
+
+// ─── Batch mode (command buffer pipelining) ────────────────────────────────
+
+void ComputeDispatch::begin_gpu_batch() {
+    if (gpu_ready_ && gpu_) {
+        gpu_->begin_batch();
+    }
+}
+
+void ComputeDispatch::end_gpu_batch() {
+    if (gpu_ready_ && gpu_) {
+        gpu_->end_batch();
+    }
+}
+
+// ─── Buffer cache management ───────────────────────────────────────────────
+
+void ComputeDispatch::clear_buffer_cache() {
+    if (gpu_) {
+        for (auto& [ptr, buf_id] : wrapped_buffer_cache_) {
+            gpu_->free_buffer(buf_id);
+        }
+    }
+    wrapped_buffer_cache_.clear();
 }
 
 }  // namespace nexus::compute
