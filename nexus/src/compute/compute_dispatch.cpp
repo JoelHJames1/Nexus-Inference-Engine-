@@ -385,6 +385,41 @@ bool ComputeDispatch::gpu_residual_add(MetalBackend::buffer_id buf_a,
     return gpu_->residual_add(buf_a, buf_b, buf_out, n);
 }
 
+bool ComputeDispatch::gpu_ffn_fused(const float* input, int hidden_dim,
+                                     MetalBackend::buffer_id buf_w1,
+                                     MetalBackend::buffer_id buf_w3,
+                                     MetalBackend::buffer_id buf_w2,
+                                     int ffn_dim, float* output) {
+    if (!gpu_ready_ || !gpu_pool_ready_) return false;
+
+    // Upload input activation once
+    size_t in_size = hidden_dim * sizeof(float);
+    gpu_->copy_to_buffer(gpu_pool_.hidden, input, in_size);
+
+    // Start persistent batch — all 4 dispatches share one command buffer
+    gpu_->begin_batch();
+
+    // W1 GEMV: hidden → ffn_gate
+    gpu_->gemm_int4_gpu(gpu_pool_.hidden, buf_w1, gpu_pool_.ffn_gate, ffn_dim, hidden_dim);
+    // W3 GEMV: hidden → ffn_up (no barrier needed — reads same input, writes different output)
+    gpu_->gemm_int4_gpu(gpu_pool_.hidden, buf_w3, gpu_pool_.ffn_up, ffn_dim, hidden_dim);
+    // SwiGLU: ffn_gate = silu(ffn_gate) * ffn_up
+    gpu_->swiglu_fused(gpu_pool_.ffn_gate, gpu_pool_.ffn_up, gpu_pool_.ffn_gate, ffn_dim);
+    // W2 GEMV: ffn_gate → ffn_out
+    gpu_->gemm_int4_gpu(gpu_pool_.ffn_gate, buf_w2, gpu_pool_.ffn_out, hidden_dim, ffn_dim);
+
+    // ONE commit for all 4 dispatches
+    gpu_->end_batch();
+
+    // Download result
+    void* result = gpu_->buffer_contents(gpu_pool_.ffn_out);
+    if (result) {
+        memcpy(output, result, hidden_dim * sizeof(float));
+        return true;
+    }
+    return false;
+}
+
 MetalBackend::buffer_id ComputeDispatch::get_cached_buffer(const void* ptr) const {
     auto it = wrapped_buffer_cache_.find(ptr);
     return (it != wrapped_buffer_cache_.end()) ? it->second : 0;

@@ -155,6 +155,16 @@ public:
                           MetalBackend::buffer_id buf_b,
                           MetalBackend::buffer_id buf_out, uint32_t n);
 
+    /// Fused FFN: encode W1 GEMV + W3 GEMV + SwiGLU + W2 GEMV as 4 dispatches
+    /// on ONE command buffer with memory barriers. Only 1 commit for the whole FFN.
+    /// Input: activations on CPU. Output: result on CPU.
+    /// Weight buffers must be pre-cached MTLBuffer IDs.
+    bool gpu_ffn_fused(const float* input, int hidden_dim,
+                       MetalBackend::buffer_id buf_w1,
+                       MetalBackend::buffer_id buf_w3,
+                       MetalBackend::buffer_id buf_w2,
+                       int ffn_dim, float* output);
+
     /// Access the GPU buffer pool (for callers that need specific buffer IDs).
     const GPUBufferPool& gpu_pool() const { return gpu_pool_; }
 

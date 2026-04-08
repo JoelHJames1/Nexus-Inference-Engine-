@@ -1081,33 +1081,16 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
             int ffn = lw.ffn_dim;
             auto& gpu = compute::global_compute();
 
-            // GPU-RESIDENT PATH: all 3 GEMMs + SiLU stay on GPU
+            // FUSED FFN: 4 GPU dispatches with ONE command buffer commit
             if (gpu.has_gpu_pool() && lw.ffn_w1_raw.data && lw.ffn_w2_raw.data && lw.ffn_w3_raw.data) {
-                auto& pool = gpu.gpu_pool();
-
-                // Get cached weight buffer IDs
                 auto buf_w1 = gpu.get_cached_buffer(lw.ffn_w1_raw.data);
                 auto buf_w3 = gpu.get_cached_buffer(lw.ffn_w3_raw.data);
                 auto buf_w2 = gpu.get_cached_buffer(lw.ffn_w2_raw.data);
 
                 if (buf_w1 && buf_w2 && buf_w3) {
-                    // Upload activation to GPU once
-                    gpu.upload_to_gpu(x, pool.hidden, dim * sizeof(float));
-
-                    // gate = x @ w1 (GPU-resident, zero CPU copy)
-                    gpu.gemm_int4_gpu(pool.hidden, buf_w1, pool.ffn_gate, 1, ffn, dim);
-                    // up = x @ w3 (GPU-resident)
-                    gpu.gemm_int4_gpu(pool.hidden, buf_w3, pool.ffn_up, 1, ffn, dim);
-                    // SiLU(gate) * up on GPU
-                    gpu.gpu_swiglu(pool.ffn_gate, pool.ffn_up, ffn);
-                    // out = gate_buf @ w2 (GPU-resident)
-                    gpu.gemm_int4_gpu(pool.ffn_gate, buf_w2, pool.ffn_out, 1, dim, ffn);
-
-                    // Flush batch to commit GPU work, then download
-                    gpu.end_gpu_batch();
-                    gpu.download_from_gpu(pool.ffn_out, out, dim * sizeof(float));
-                    gpu.begin_gpu_batch();
-                    return;
+                    if (gpu.gpu_ffn_fused(x, dim, buf_w1, buf_w3, buf_w2, ffn, out)) {
+                        return;
+                    }
                 }
             }
 
