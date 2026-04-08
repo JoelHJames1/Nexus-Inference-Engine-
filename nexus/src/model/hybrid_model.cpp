@@ -259,7 +259,10 @@ float* HybridModel::Impl::load_tensor(const char* name,
 float* HybridModel::Impl::load_tensor_raw(const char* name,
                                             HybridLayerWeights::RawWeight& raw,
                                             std::vector<int64_t>* shape_out) {
-    // First, store the raw mapped pointer for fused GPU path
+    // Map the raw chunk and store pointer for fused GPU path.
+    // If GPU is available, we SKIP the FP32 dequant entirely — the GPU
+    // reads INT4 data directly via the fused shader. This saves massive
+    // memory (no 4x expansion) and time (no CPU dequant).
     const auto* info = reader->get_tensor(name);
     if (info && !info->chunks.empty()) {
         const auto& chunk = info->chunks[0];
@@ -269,7 +272,18 @@ float* HybridModel::Impl::load_tensor_raw(const char* name,
             raw.bytes = chunk.compressed_size;
         }
     }
-    // Then do the normal load (with CPU dequant as fallback)
+
+    // If GPU is available and we have the raw pointer, skip CPU dequant.
+    // The fused_gemm() path will use gemm_int4() directly on the raw data.
+    // Only fall back to FP32 dequant for small tensors (norms, biases)
+    // that aren't worth GPU-dispatching.
+    if (raw.data && raw.bytes > 0 && compute::global_compute().has_gpu()) {
+        if (shape_out && info) *shape_out = info->shape;
+        // Return nullptr for the FP32 pointer — fused_gemm checks raw first
+        return nullptr;
+    }
+
+    // CPU fallback: full dequant to FP32
     return load_tensor(name, shape_out);
 }
 
@@ -1008,8 +1022,27 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
     memset(out, 0, dim * sizeof(float));
 
     if (!lw.moe_gate || lw.num_experts <= 0) {
-        // No MoE — try to use expert weights as a single dense FFN fallback
-        // or just output zeros (layer becomes a skip connection)
+        // No MoE — check for dense FFN (SwiGLU: out = silu(x @ w1) * (x @ w3) @ w2)
+        if (lw.ffn_dim > 0 && (lw.ffn_w1_raw.data || lw.ffn_w1)) {
+            int ffn = lw.ffn_dim;
+            std::vector<float> gate_buf(ffn);
+            std::vector<float> up_buf(ffn);
+
+            // Apply pre-FFN norm if present
+            const float* ffn_input = x;
+            // gate = x @ w1
+            fused_gemm(ffn_input, lw.ffn_w1, lw.ffn_w1_raw, gate_buf.data(), 1, ffn, dim);
+            // up = x @ w3
+            fused_gemm(ffn_input, lw.ffn_w3, lw.ffn_w3_raw, up_buf.data(), 1, ffn, dim);
+            // SiLU(gate) * up
+            for (int i = 0; i < ffn; i++) {
+                float s = gate_buf[i] / (1.0f + expf(-gate_buf[i]));
+                gate_buf[i] = s * up_buf[i];
+            }
+            // out = gate_buf @ w2
+            fused_gemm(gate_buf.data(), lw.ffn_w2, lw.ffn_w2_raw, out, 1, dim, ffn);
+            return;
+        }
         return;
     }
 
@@ -1226,6 +1259,19 @@ bool HybridModel::Impl::load_layer_weights(uint32_t layer_idx) {
                        lw.expert_w3_raw, lw.expert_w3_bytes);
     }
     load("ffn_gate_inp_shexp.weight", lw.shared_expert_gate);
+
+    // ── Dense FFN (non-MoE models like Gemma, LLaMA) ──
+    // Check for feed_forward.w1/w2/w3 (standard SwiGLU FFN)
+    if (!lw.moe_gate && !lw.expert_w1_raw) {
+        std::vector<int64_t> w1_shape;
+        load_raw("feed_forward.w1.weight", lw.ffn_w1, lw.ffn_w1_raw, &w1_shape);
+        load_raw("feed_forward.w2.weight", lw.ffn_w2, lw.ffn_w2_raw);
+        load_raw("feed_forward.w3.weight", lw.ffn_w3, lw.ffn_w3_raw);
+        load("ffn_norm.weight", lw.ffn_norm);
+        if (w1_shape.size() >= 2) {
+            lw.ffn_dim = static_cast<int>(w1_shape[1]);
+        }
+    }
 
     // ── Type-specific weights ──
     if (lw.type == HybridLayerType::SSM_MoE) {

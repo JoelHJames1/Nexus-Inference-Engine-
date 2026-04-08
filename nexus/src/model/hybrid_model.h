@@ -89,6 +89,14 @@ struct HybridLayerWeights {
     RawWeight moe_gate_raw;              // Raw INT4 for router gate
     RawWeight output_weight_raw;         // Raw INT4 for final output projection
 
+    // ── Dense FFN (for non-MoE models like Gemma, LLaMA) ──────────────────
+    float* ffn_w1 = nullptr;              // [hidden_dim, ffn_dim] — gate proj
+    float* ffn_w2 = nullptr;              // [ffn_dim, hidden_dim] — down proj
+    float* ffn_w3 = nullptr;              // [hidden_dim, ffn_dim] — up proj
+    float* ffn_norm = nullptr;            // [hidden_dim] — pre-FFN norm
+    RawWeight ffn_w1_raw, ffn_w2_raw, ffn_w3_raw;
+    int ffn_dim = 0;
+
     // Shape metadata read from tensor info (stored per-layer for flexibility)
     int qkv_out_dim = 0;                 // Output dimension of fused QKV
     int q_out_dim = 0;                   // Output dimension of separate Q
