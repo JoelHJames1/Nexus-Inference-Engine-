@@ -222,6 +222,16 @@ public:
                           MetalBackend::buffer_id buf_b,
                           MetalBackend::buffer_id buf_out, uint32_t n);
 
+    /// Fused QKV: RMSNorm + Q + K + V projections in ONE GPU dispatch.
+    bool fused_qkv(const float* hidden, int dim,
+                   MetalBackend::buffer_id buf_norm_w,
+                   MetalBackend::buffer_id buf_wq,
+                   MetalBackend::buffer_id buf_wk,
+                   MetalBackend::buffer_id buf_wv,
+                   int q_dim, int k_dim, int v_dim,
+                   float eps,
+                   float* q_out, float* k_out, float* v_out);
+
     /// Fused FFN: RMSNorm + W1 + W3 + SiLU + W2 + Residual in ONE GPU dispatch.
     /// hidden_state is input (and residual source). output gets final result.
     /// All weight buffers must be pre-cached buffer IDs.

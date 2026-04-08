@@ -108,6 +108,20 @@ public:
         float    rms_eps;
     };
 
+    struct FusedQKVParams {
+        uint32_t dim;
+        uint32_t q_dim;
+        uint32_t k_dim;
+        uint32_t v_dim;
+        float    rms_eps;
+    };
+
+    /// Fused QKV: RMSNorm + Q + K + V projections in ONE dispatch.
+    bool fused_qkv_int4(buffer_id buf_hidden, buffer_id buf_norm_w,
+                         buffer_id buf_wq, buffer_id buf_wk, buffer_id buf_wv,
+                         buffer_id buf_q, buffer_id buf_k, buffer_id buf_v,
+                         const FusedQKVParams& params);
+
     /// Fused FFN: RMSNorm + W1 + W3 + SiLU*mul + W2 + Residual in ONE dispatch.
     /// hidden is both input and residual source. output gets the final result.
     bool fused_ffn_int4(buffer_id buf_hidden, buffer_id buf_norm_w,

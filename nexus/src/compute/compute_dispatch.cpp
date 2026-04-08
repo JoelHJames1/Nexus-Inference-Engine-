@@ -589,6 +589,54 @@ bool ComputeDispatch::gpu_residual_add(MetalBackend::buffer_id buf_a,
     return gpu_->residual_add(buf_a, buf_b, buf_out, n);
 }
 
+bool ComputeDispatch::fused_qkv(const float* hidden, int dim,
+                                 MetalBackend::buffer_id buf_norm_w,
+                                 MetalBackend::buffer_id buf_wq,
+                                 MetalBackend::buffer_id buf_wk,
+                                 MetalBackend::buffer_id buf_wv,
+                                 int q_dim, int k_dim, int v_dim,
+                                 float eps,
+                                 float* q_out, float* k_out, float* v_out) {
+    if (!gpu_ready_ || !gpu_) return false;
+
+    size_t h_size = dim * sizeof(float);
+    int max_out = std::max({q_dim, k_dim, v_dim});
+    size_t out_size = max_out * sizeof(float);
+
+    auto buf_h = ensure_buffer(buf_a_, h_size);
+    // Use pool buffers for Q/K/V output (pre-allocated, zero per-call alloc)
+    if (!gpu_pool_ready_) return false;
+    auto buf_q = gpu_pool_.q_buf;
+    auto buf_k = gpu_pool_.k_buf;
+    auto buf_v = gpu_pool_.v_buf;
+
+    if (!buf_h || !buf_q || !buf_k || !buf_v) return false;
+
+    gpu_->copy_to_buffer(buf_h, hidden, h_size);
+
+    MetalBackend::FusedQKVParams params;
+    params.dim = dim;
+    params.q_dim = q_dim;
+    params.k_dim = k_dim;
+    params.v_dim = v_dim;
+    params.rms_eps = eps;
+
+    bool ok = gpu_->fused_qkv_int4(buf_h, buf_norm_w, buf_wq, buf_wk, buf_wv,
+                                     buf_q, buf_k, buf_v, params);
+    if (ok) {
+        void* rq = gpu_->buffer_contents(buf_q);
+        void* rk = gpu_->buffer_contents(buf_k);
+        void* rv = gpu_->buffer_contents(buf_v);
+        if (rq && rk && rv) {
+            memcpy(q_out, rq, q_dim * sizeof(float));
+            memcpy(k_out, rk, k_dim * sizeof(float));
+            memcpy(v_out, rv, v_dim * sizeof(float));
+            return true;
+        }
+    }
+    return false;
+}
+
 bool ComputeDispatch::fused_ffn(const float* hidden, int dim,
                                  MetalBackend::buffer_id buf_norm_w,
                                  MetalBackend::buffer_id buf_w1,

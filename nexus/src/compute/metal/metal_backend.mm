@@ -602,6 +602,43 @@ bool MetalBackend::attention_gpu(buffer_id buf_q, buffer_id buf_k_cache,
     return true;
 }
 
+// ─── Fused QKV (RMSNorm + Q + K + V projections) ───────────────────────────
+
+bool MetalBackend::fused_qkv_int4(buffer_id buf_hidden, buffer_id buf_norm_w,
+                                    buffer_id buf_wq, buffer_id buf_wk, buffer_id buf_wv,
+                                    buffer_id buf_q, buffer_id buf_k, buffer_id buf_v,
+                                    const FusedQKVParams& params)
+{
+    if (!is_ready()) return false;
+
+    id<MTLComputePipelineState> pso = impl_->pipeline("fused_qkv_int4");
+    if (!pso) return false;
+
+    auto [cb, enc] = impl_->begin_compute();
+    if (!enc) return false;
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:handle_to_buffer(buf_hidden) offset:0 atIndex:0];
+    [enc setBuffer:handle_to_buffer(buf_norm_w) offset:0 atIndex:1];
+    [enc setBuffer:handle_to_buffer(buf_wq) offset:0 atIndex:2];
+    [enc setBuffer:handle_to_buffer(buf_wk) offset:0 atIndex:3];
+    [enc setBuffer:handle_to_buffer(buf_wv) offset:0 atIndex:4];
+    [enc setBuffer:handle_to_buffer(buf_q) offset:0 atIndex:5];
+    [enc setBuffer:handle_to_buffer(buf_k) offset:0 atIndex:6];
+    [enc setBuffer:handle_to_buffer(buf_v) offset:0 atIndex:7];
+    [enc setBytes:&params length:sizeof(params) atIndex:8];
+
+    // Grid covers the max output dimension (Q is usually largest)
+    uint32_t max_out = std::max({params.q_dim, params.k_dim, params.v_dim});
+    NSUInteger tg = std::min<NSUInteger>([pso maxTotalThreadsPerThreadgroup], 1024);
+    MTLSize threadgroup_size = MTLSizeMake(tg, 1, 1);
+    MTLSize grid_size = MTLSizeMake((max_out + tg - 1) / tg, 1, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:threadgroup_size];
+
+    impl_->end_compute(cb, enc);
+    return true;
+}
+
 // ─── Fused FFN (RMSNorm + W1 + W3 + SiLU + W2 + Residual) ─────────────────
 
 bool MetalBackend::fused_ffn_int4(buffer_id buf_hidden, buffer_id buf_norm_w,

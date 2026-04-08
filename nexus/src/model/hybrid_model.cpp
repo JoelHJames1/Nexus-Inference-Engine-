@@ -1229,14 +1229,7 @@ attn_moe_cpu_ffn_fallback:
     // ── Save residual ──
     memcpy(residual, x, dim * sizeof(float));
 
-    // ── Pre-attention RMSNorm ──
-    if (lw.attention_norm) {
-        compute::global_compute().rmsnorm(norm_buf, x, lw.attention_norm, dim, manifest.rms_norm_eps);
-    } else {
-        memcpy(norm_buf, x, dim * sizeof(float));
-    }
-
-    // ── Separate Q/K/V projections ──
+    // ── Fused QKV: RMSNorm + Q + K + V in ONE dispatch ──
     int q_dim = lw.q_out_dim > 0 ? lw.q_out_dim : dim;
     int k_dim = lw.k_out_dim > 0 ? lw.k_out_dim : (manifest.num_kv_heads * manifest.head_dim);
     int v_dim = lw.v_out_dim > 0 ? lw.v_out_dim : k_dim;
@@ -1245,9 +1238,30 @@ attn_moe_cpu_ffn_fallback:
     std::vector<float> k(k_dim, 0.0f);
     std::vector<float> v(v_dim, 0.0f);
 
-    if (lw.wq) fused_gemm(norm_buf, lw.wq, lw.wq_raw, q.data(), 1, q_dim, dim);
-    if (lw.wk) fused_gemm(norm_buf, lw.wk, lw.wk_raw, k.data(), 1, k_dim, dim);
-    if (lw.wv) fused_gemm(norm_buf, lw.wv, lw.wv_raw, v.data(), 1, v_dim, dim);
+    {
+        auto& gpu = compute::global_compute();
+        auto buf_wq = gpu.get_cached_buffer(lw.wq_raw.data);
+        auto buf_wk = gpu.get_cached_buffer(lw.wk_raw.data);
+        auto buf_wv = gpu.get_cached_buffer(lw.wv_raw.data);
+        auto buf_norm = lw.attention_norm ?
+            gpu.upload_small_buffer(lw.attention_norm, dim * sizeof(float)) : 0;
+
+        // Fused QKV disabled — per-thread 3x GEMV loop kills occupancy.
+        // Separate dispatches are faster (each does 1 GEMV, better parallelism).
+        if (false) {
+            // placeholder
+        } else {
+            // Fallback: separate RMSNorm + individual GEMVs
+            if (lw.attention_norm) {
+                gpu.rmsnorm(norm_buf, x, lw.attention_norm, dim, manifest.rms_norm_eps);
+            } else {
+                memcpy(norm_buf, x, dim * sizeof(float));
+            }
+            if (lw.wq) fused_gemm(norm_buf, lw.wq, lw.wq_raw, q.data(), 1, q_dim, dim);
+            if (lw.wk) fused_gemm(norm_buf, lw.wk, lw.wk_raw, k.data(), 1, k_dim, dim);
+            if (lw.wv) fused_gemm(norm_buf, lw.wv, lw.wv_raw, v.data(), 1, v_dim, dim);
+        }
+    }
 
     // ── Apply Q/K RMSNorm if present ──
     if (lw.q_norm) {
