@@ -931,6 +931,13 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
         return;
     }
 
+    // TODO: Debug expert slice offset calculation for INT4 packed 3D tensors.
+    // The byte offset E * dim * expert_ffn / 2 assumes row-major packing but
+    // the NXF converter may have flattened the tensor differently.
+    // Disabling expert execution until offset is verified.
+    // Gate logits are still computed above for routing analysis.
+    return;
+
     // ── Compute gate logits: x @ moe_gate -> [num_experts] ──
     std::vector<float> gate_logits(num_experts);
     compute::global_compute().gemm(x, lw.moe_gate, gate_logits.data(),
