@@ -32,6 +32,21 @@ Every existing inference engine (llama.cpp, MLX, ollama) assumes the model fits 
 | **API server** | Basic | **OpenAI-compatible** with SSE streaming |
 | **Apple Silicon target** | Generic (cross-platform) | **Purpose-built** (Metal, AMX, ANE) |
 
+### NEXUS vs AirLLM
+
+AirLLM pioneered the concept of layer streaming for large models. NEXUS takes that concept and builds a production engine around it.
+
+| Feature | AirLLM | NEXUS |
+|---------|--------|-------|
+| **Language** | Python (PyTorch) | C++20 + Metal shaders |
+| **Speed** | ~1-2 tok/s (70B) | Designed for 10-30+ tok/s |
+| **GPU compute** | PyTorch generic ops | Custom Metal with UMA zero-copy |
+| **KV cache** | No compression, OOMs on long context | TurboQuant (3.5-bit) + H2O eviction |
+| **Model format** | Reads safetensors (no streaming optimization) | NXF (16KB page-aligned, per-tensor codec) |
+| **MoE** | Not supported | Expert LRU cache + predictive prefetch |
+| **Speculative decoding** | No | EAGLE-3 on Neural Engine |
+| **Memory management** | Python GC | Custom UMA allocator + GCD async I/O |
+
 ### How does a 405B model fit in 48GB?
 
 ```
