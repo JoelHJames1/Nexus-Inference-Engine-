@@ -91,6 +91,10 @@ struct HybridModel::Impl {
     void evict_layer_weights(uint32_t layer_idx);
     bool load_embedding_weights();
 
+    // Load tensor and also store raw INT4 pointer for fused GPU path
+    float* load_tensor_raw(const char* name, HybridLayerWeights::RawWeight& raw,
+                           std::vector<int64_t>* shape_out = nullptr);
+
     // ─── Tensor loading helpers ───────────────────────────────────────────
     /// Load a tensor by name, returning the mapped pointer and optionally
     /// filling in shape dimensions. Returns nullptr if tensor not found.
@@ -231,6 +235,23 @@ float* HybridModel::Impl::load_tensor(const char* name,
     }
 
     return fp32_buf;
+}
+
+float* HybridModel::Impl::load_tensor_raw(const char* name,
+                                            HybridLayerWeights::RawWeight& raw,
+                                            std::vector<int64_t>* shape_out) {
+    // First, store the raw mapped pointer for fused GPU path
+    const auto* info = reader->get_tensor(name);
+    if (info && !info->chunks.empty()) {
+        const auto& chunk = info->chunks[0];
+        const void* mapped = reader->map_chunk(chunk);
+        if (mapped) {
+            raw.data = mapped;
+            raw.bytes = chunk.compressed_size;
+        }
+    }
+    // Then do the normal load (with CPU dequant as fallback)
+    return load_tensor(name, shape_out);
 }
 
 // ─── Layer type detection ───────────────────────────────────────────────────
@@ -538,8 +559,15 @@ void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
     // attn_qkv: [hidden_dim, qkv_out_dim] — single matmul
     int qkv_dim = lw.qkv_out_dim;
     if (lw.attn_qkv && qkv_dim > 0) {
-        compute::global_compute().gemm(norm_buf, lw.attn_qkv, qkv_buf,
-                         1, qkv_dim, dim);
+        // Try fused INT4 GPU path first (zero-copy UMA, ~8x faster)
+        if (lw.attn_qkv_raw.data && lw.attn_qkv_raw.bytes > 0) {
+            compute::global_compute().gemm_int4(norm_buf, lw.attn_qkv_raw.data,
+                                                 lw.attn_qkv_raw.bytes, qkv_buf,
+                                                 1, qkv_dim, dim);
+        } else {
+            compute::global_compute().gemm(norm_buf, lw.attn_qkv, qkv_buf,
+                                            1, qkv_dim, dim);
+        }
     } else {
         // No QKV weights — zero out and skip attention
         memset(qkv_buf, 0, dim * sizeof(float));
@@ -1147,9 +1175,12 @@ bool HybridModel::Impl::load_layer_weights(uint32_t layer_idx) {
 
     // ── Type-specific weights ──
     if (lw.type == HybridLayerType::SSM_MoE) {
-        // Fused QKV
+        // Fused QKV — use load_tensor_raw to get both FP32 + raw INT4 pointer
         std::vector<int64_t> qkv_shape;
-        load("attn_qkv.weight", lw.attn_qkv, &qkv_shape);
+        {
+            std::string name = layer_tensor_name(layer_idx, "attn_qkv.weight");
+            lw.attn_qkv = load_tensor_raw(name.c_str(), lw.attn_qkv_raw, &qkv_shape);
+        }
         if (lw.attn_qkv && qkv_shape.size() >= 2) {
             lw.qkv_out_dim = static_cast<int>(qkv_shape[1]);
         }

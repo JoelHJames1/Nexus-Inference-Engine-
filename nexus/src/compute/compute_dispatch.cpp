@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <vector>
 
 namespace nexus::compute {
 
@@ -114,6 +115,59 @@ void ComputeDispatch::gemm(const float* A, const float* B, float* C,
 cpu_fallback:
     // CPU path: Accelerate cblas_sgemm (auto-uses AMX coprocessor)
     compute::gemm_f32(A, B, C, M, N, K, false, false);
+}
+
+// ─── Fused INT4 GEMM (zero-copy UMA path) ──────────────────────────────────
+
+void ComputeDispatch::gemm_int4(const float* activations, const void* weights_int4,
+                                 size_t weights_bytes, float* out,
+                                 int M, int N, int K) {
+    if (gpu_ready_ && weights_int4 && activations && out) {
+        // UMA zero-copy: wrap the mmap'd INT4 pointer directly as an MTLBuffer.
+        // No allocation, no memcpy, no CPU dequant. The GPU reads the INT4 data
+        // from the SAME physical memory pages that mmap provided.
+        auto buf_w = gpu_->wrap_pointer(const_cast<void*>(weights_int4), weights_bytes);
+        if (buf_w) {
+            size_t act_size = static_cast<size_t>(M) * K * sizeof(float);
+            size_t out_size = static_cast<size_t>(M) * N * sizeof(float);
+
+            auto buf_a = ensure_buffer(buf_a_, act_size);
+            auto buf_out = ensure_buffer(buf_c_, out_size);
+
+            if (buf_a && buf_out) {
+                gpu_->copy_to_buffer(buf_a, activations, act_size);
+
+                // Dispatch fused dequant+GEMV — the shader unpacks INT4 nibbles
+                // to FP16, multiplies with activations, all in one GPU dispatch.
+                // Using simple uniform dequant: (nibble - 8) / 8
+                if (gpu_->gemv_dequant_int4(buf_a, buf_w, 0, 0, buf_out,
+                                             M, N, K, 128)) {
+                    void* result = gpu_->buffer_contents(buf_out);
+                    if (result) {
+                        memcpy(out, result, out_size);
+                        gpu_->free_buffer(buf_w);
+                        return;
+                    }
+                }
+            }
+            gpu_->free_buffer(buf_w);
+        }
+    }
+
+    // CPU fallback: dequant INT4 to FP32, then GEMM
+    size_t num_elements = static_cast<size_t>(K) * N;
+    std::vector<float> fp32_weights(num_elements);
+    const uint8_t* src = static_cast<const uint8_t*>(weights_int4);
+    size_t safe_bytes = std::min(weights_bytes, (num_elements + 1) / 2);
+    for (size_t i = 0; i < safe_bytes; i++) {
+        uint8_t packed = src[i];
+        size_t idx = i * 2;
+        if (idx < num_elements)
+            fp32_weights[idx] = (static_cast<float>(packed & 0x0F) - 8.0f) * 0.125f;
+        if (idx + 1 < num_elements)
+            fp32_weights[idx + 1] = (static_cast<float>(packed >> 4) - 8.0f) * 0.125f;
+    }
+    compute::gemm_f32(activations, fp32_weights.data(), out, M, N, K, false, false);
 }
 
 void ComputeDispatch::gemv_int4(float* out, const float* activations,

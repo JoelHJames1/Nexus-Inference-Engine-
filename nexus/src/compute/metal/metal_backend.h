@@ -84,6 +84,11 @@ public:
     /// Allocate a storageModeShared MTLBuffer.  Returns handle or 0.
     buffer_id alloc_shared_buffer(size_t bytes);
 
+    /// Wrap an existing mmap'd pointer as an MTLBuffer (TRUE zero-copy on UMA).
+    /// The pointer must be page-aligned and the memory must stay valid while
+    /// the buffer is in use. This is the fastest path — no allocation, no copy.
+    buffer_id wrap_pointer(void* ptr, size_t bytes);
+
     /// Copy CPU data into a shared buffer (memcpy — zero-copy on UMA means
     /// this writes directly to GPU-visible memory).
     bool copy_to_buffer(buffer_id buffer_handle, const void* data, size_t size);

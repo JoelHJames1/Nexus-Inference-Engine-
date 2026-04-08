@@ -343,6 +343,28 @@ MetalBackend::buffer_id MetalBackend::alloc_shared_buffer(size_t bytes)
     return reinterpret_cast<uint64_t>((__bridge_retained void*)buf);
 }
 
+MetalBackend::buffer_id MetalBackend::wrap_pointer(void* ptr, size_t bytes)
+{
+    if (!is_ready() || !ptr || bytes == 0) return 0;
+    auto* ci = impl_->ci();
+    // newBufferWithBytesNoCopy: wraps existing memory as an MTLBuffer.
+    // On Apple Silicon UMA, this is true zero-copy — the GPU accesses
+    // the SAME physical pages as the CPU, no allocation or memcpy.
+    // The pointer must be page-aligned (16KB on arm64).
+    id<MTLBuffer> buf = [ci->device newBufferWithBytesNoCopy:ptr
+                                                      length:bytes
+                                                     options:MTLResourceStorageModeShared
+                                                 deallocator:nil];
+    if (!buf) {
+        // Fallback: pointer might not be page-aligned. Allocate and copy.
+        buf = [ci->device newBufferWithBytes:ptr
+                                      length:bytes
+                                     options:MTLResourceStorageModeShared];
+    }
+    if (!buf) return 0;
+    return reinterpret_cast<uint64_t>((__bridge_retained void*)buf);
+}
+
 bool MetalBackend::copy_to_buffer(buffer_id buffer_handle, const void* data,
                                   size_t size)
 {

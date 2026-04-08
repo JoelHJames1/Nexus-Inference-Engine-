@@ -47,6 +47,18 @@ public:
                    const uint8_t* weights_q, const float* scales, const float* zeros,
                    int M, int N, int K, int group_size);
 
+    /// GEMM with raw INT4 weights — UMA zero-copy path.
+    /// Wraps the mmap'd INT4 pointer directly as an MTLBuffer, dispatches
+    /// fused dequant+GEMV on GPU. Falls back to CPU dequant+GEMM.
+    /// This is the FAST PATH — no CPU dequant, no memcpy, no allocation.
+    /// @param activations FP32 input [M, K]
+    /// @param weights_int4 Raw mmap'd INT4 packed data (2 values per byte)
+    /// @param weights_bytes Size of the INT4 data in bytes
+    /// @param out FP32 output [M, N]
+    void gemm_int4(const float* activations, const void* weights_int4,
+                   size_t weights_bytes, float* out,
+                   int M, int N, int K);
+
     // ─── Element-wise operations ────────────────────────────────────────
 
     /// RMSNorm: out = x * weight / sqrt(mean(x^2) + eps)

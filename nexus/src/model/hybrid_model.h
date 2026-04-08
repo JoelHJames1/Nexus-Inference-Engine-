@@ -76,6 +76,16 @@ struct HybridLayerWeights {
     size_t expert_w2_bytes = 0;
     size_t expert_w3_bytes = 0;
 
+    // Raw INT4 data for main weight tensors (for fused GPU GEMV path).
+    // When set, gemm_int4() can skip CPU dequant entirely.
+    struct RawWeight {
+        const void* data = nullptr;
+        size_t bytes = 0;
+    };
+    RawWeight attn_qkv_raw;              // Raw INT4 for fused QKV
+    RawWeight wq_raw, wk_raw, wv_raw, wo_raw;  // Raw INT4 for separate attention
+    RawWeight moe_gate_raw;              // Raw INT4 for router gate
+
     // Shape metadata read from tensor info (stored per-layer for flexibility)
     int qkv_out_dim = 0;                 // Output dimension of fused QKV
     int q_out_dim = 0;                   // Output dimension of separate Q
