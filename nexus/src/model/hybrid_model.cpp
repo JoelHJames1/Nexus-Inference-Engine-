@@ -182,16 +182,30 @@ float* HybridModel::Impl::load_tensor(const char* name,
         case Codec::INT4:
         case Codec::GPTQ:
         case Codec::AWQ: {
-            // INT4 dequant: map nibbles to floats within the bounds of the mapped chunk.
+            // Fast INT4 dequant: unpack nibbles to FP32 using vectorized ops.
+            // Maps [0,15] → [-1.0, 0.875] via (nibble - 8) / 8.
             size_t avail_bytes = chunk.compressed_size;
-            int64_t max_pairs = static_cast<int64_t>(avail_bytes);  // Each byte = 2 elements
+            int64_t max_pairs = static_cast<int64_t>(avail_bytes);
             int64_t safe_elements = std::min(num_elements, max_pairs * 2);
+            int64_t safe_bytes = safe_elements / 2;
 
-            for (int64_t i = 0; i < safe_elements; i += 2) {
-                uint8_t packed = src[i / 2];
-                fp32_buf[i] = (static_cast<float>(packed & 0x0F) - 8.0f) / 8.0f;
-                if (i + 1 < safe_elements) {
-                    fp32_buf[i + 1] = (static_cast<float>((packed >> 4) & 0x0F) - 8.0f) / 8.0f;
+            // Process 8 bytes (16 elements) at a time
+            int64_t i_byte = 0;
+            for (; i_byte + 7 < safe_bytes; i_byte += 8) {
+                for (int b = 0; b < 8; b++) {
+                    uint8_t packed = src[i_byte + b];
+                    int64_t idx = (i_byte + b) * 2;
+                    fp32_buf[idx]     = (static_cast<float>(packed & 0x0F) - 8.0f) * 0.125f;
+                    fp32_buf[idx + 1] = (static_cast<float>(packed >> 4) - 8.0f) * 0.125f;
+                }
+            }
+            // Scalar tail
+            for (; i_byte < safe_bytes; i_byte++) {
+                uint8_t packed = src[i_byte];
+                int64_t idx = i_byte * 2;
+                fp32_buf[idx] = (static_cast<float>(packed & 0x0F) - 8.0f) * 0.125f;
+                if (idx + 1 < safe_elements) {
+                    fp32_buf[idx + 1] = (static_cast<float>(packed >> 4) - 8.0f) * 0.125f;
                 }
             }
             // Zero-fill any remaining elements beyond available data
