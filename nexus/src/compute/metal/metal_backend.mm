@@ -302,6 +302,37 @@ bool MetalBackend::gemm_int4_gpu(buffer_id buf_in, buffer_id buf_weight,
     return true;
 }
 
+// ─── Fused Multi-Head Attention ────────────────────────────────────────────
+
+bool MetalBackend::fused_attention_decode(buffer_id buf_Q, buffer_id buf_K_cache,
+                                           buffer_id buf_V_cache, buffer_id buf_output,
+                                           const FusedAttentionParams& params)
+{
+    if (!is_ready()) return false;
+
+    id<MTLComputePipelineState> pso = impl_->pipeline("fused_multihead_attention_decode");
+    if (!pso) return false;
+
+    auto [cb, enc] = impl_->begin_compute();
+    if (!enc) return false;
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:handle_to_buffer(buf_Q) offset:0 atIndex:0];
+    [enc setBuffer:handle_to_buffer(buf_K_cache) offset:0 atIndex:1];
+    [enc setBuffer:handle_to_buffer(buf_V_cache) offset:0 atIndex:2];
+    [enc setBuffer:handle_to_buffer(buf_output) offset:0 atIndex:3];
+    [enc setBytes:&params length:sizeof(params) atIndex:4];
+
+    // One threadgroup per query head, 256 threads per group
+    NSUInteger tg = std::min<NSUInteger>([pso maxTotalThreadsPerThreadgroup], 256);
+    MTLSize threadgroup_size = MTLSizeMake(tg, 1, 1);
+    MTLSize grid_size = MTLSizeMake(params.num_heads, 1, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:threadgroup_size];
+
+    impl_->end_compute(cb, enc);
+    return true;
+}
+
 // ─── Residual Add ──────────────────────────────────────────────────────────
 
 bool MetalBackend::residual_add(buffer_id buf_a, buffer_id buf_b,

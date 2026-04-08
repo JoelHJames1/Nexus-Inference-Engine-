@@ -1250,6 +1250,12 @@ attn_moe_cpu_ffn_fallback:
         int attn_head_dim = head_dim;
 
         if (attn_head_dim > 0 && n_heads > 0 && n_kv_heads > 0) {
+            int head_dim_q_actual = (n_heads > 0) ? (q_dim / n_heads) : q_dim;
+            int out_attn_dim = n_heads * attn_head_dim;
+            auto& gpu = compute::global_compute();
+
+            // CPU attention (2.7 tok/s) — fused GPU attention needs pre-allocated
+            // KV buffers to avoid per-call alloc overhead. TODO: pre-alloc KV on GPU.
             gqa_attention(q.data(), q_dim, k.data(), v.data(), k_dim,
                           kv, seq_pos, n_heads, n_kv_heads, attn_head_dim,
                           attn_output);

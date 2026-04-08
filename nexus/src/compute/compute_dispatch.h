@@ -180,6 +180,17 @@ public:
                        int num_heads, int num_kv_heads,
                        int head_dim_q, int head_dim_kv);
 
+    /// Fused multi-head attention: ALL heads in 1 dispatch.
+    /// Q is FP32 on CPU. KV cache is FP16 (uint16*) on CPU.
+    /// Uploads to GPU, dispatches fused kernel, downloads result.
+    bool fused_attention(const float* q, int q_dim,
+                         const float* k_new, const float* v_new, int kv_dim,
+                         uint16_t* k_cache, uint16_t* v_cache,
+                         int seq_pos, int max_seq,
+                         int num_heads, int num_kv_heads,
+                         int head_dim_q, int head_dim_kv,
+                         float* output, int out_dim);
+
     /// GPU-resident INT4 GEMV: input and output are GPU buffer IDs.
     /// No CPU↔GPU copies — dispatches directly on resident buffers.
     bool gemm_int4_gpu(MetalBackend::buffer_id buf_in,

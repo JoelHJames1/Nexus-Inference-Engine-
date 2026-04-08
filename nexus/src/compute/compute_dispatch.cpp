@@ -5,6 +5,7 @@
 
 #include "compute/compute_dispatch.h"
 #include "compute/accelerate/gemm.h"
+#include "model/hybrid_model.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -441,6 +442,74 @@ bool ComputeDispatch::attention_gpu(MetalBackend::buffer_id buf_q,
     gpu_->free_buffer(buf_k_layer);
     gpu_->free_buffer(buf_v_layer);
 
+    return ok;
+}
+
+bool ComputeDispatch::fused_attention(
+    const float* q, int q_dim,
+    const float* k_new, const float* v_new, int kv_dim,
+    uint16_t* k_cache, uint16_t* v_cache,
+    int seq_pos, int max_seq,
+    int num_heads, int num_kv_heads,
+    int head_dim_q, int head_dim_kv,
+    float* output, int out_dim)
+{
+    if (!gpu_ready_ || !gpu_) return false;
+
+    // 1. Store new K/V in FP16 cache (CPU side — fast bit conversion)
+    for (int i = 0; i < kv_dim; i++) {
+        k_cache[seq_pos * kv_dim + i] = nexus::model::HybridKVCache::f32_to_f16(k_new[i]);
+        v_cache[seq_pos * kv_dim + i] = nexus::model::HybridKVCache::f32_to_f16(v_new[i]);
+    }
+    int seq_len = seq_pos + 1;
+
+    // 2. Upload Q, wrap KV cache as GPU buffers
+    size_t q_size = q_dim * sizeof(float);
+    size_t out_size = out_dim * sizeof(float);
+    size_t kv_cache_size = static_cast<size_t>(max_seq) * kv_dim * sizeof(uint16_t);
+
+    auto buf_q = ensure_buffer(buf_a_, q_size);
+    auto buf_out = ensure_buffer(buf_c_, out_size);
+    // Allocate and copy FP16 KV data to GPU buffers
+    size_t kv_used = static_cast<size_t>(seq_len) * kv_dim * sizeof(uint16_t);
+    auto buf_k = gpu_->alloc_shared_buffer(kv_cache_size);
+    auto buf_v = gpu_->alloc_shared_buffer(kv_cache_size);
+
+    if (!buf_q || !buf_out || !buf_k || !buf_v) {
+        if (buf_k) gpu_->free_buffer(buf_k);
+        if (buf_v) gpu_->free_buffer(buf_v);
+        return false;
+    }
+
+    gpu_->copy_to_buffer(buf_q, q, q_size);
+    gpu_->copy_to_buffer(buf_k, k_cache, kv_used);
+    gpu_->copy_to_buffer(buf_v, v_cache, kv_used);
+
+    // 3. Dispatch fused multi-head attention (ALL heads, 1 dispatch)
+    int dot_dim = std::min(head_dim_q, head_dim_kv);
+    MetalBackend::FusedAttentionParams params;
+    params.num_heads = num_heads;
+    params.num_kv_heads = num_kv_heads;
+    params.head_dim_q = head_dim_q;
+    params.head_dim_kv = head_dim_kv;
+    params.dot_dim = dot_dim;
+    params.out_head_dim = head_dim_kv;
+    params.seq_len = seq_len;
+    params.kv_dim = kv_dim;
+    params.scale = 1.0f / sqrtf(static_cast<float>(dot_dim));
+
+    bool ok = gpu_->fused_attention_decode(buf_q, buf_k, buf_v, buf_out, params);
+
+    // 4. Read result
+    if (ok) {
+        void* result = gpu_->buffer_contents(buf_out);
+        if (result) {
+            memcpy(output, result, out_size);
+        }
+    }
+
+    gpu_->free_buffer(buf_k);
+    gpu_->free_buffer(buf_v);
     return ok;
 }
 

@@ -100,6 +100,25 @@ public:
     bool residual_add(buffer_id buf_a, buffer_id buf_b,
                       buffer_id buf_output, uint32_t n);
 
+    // ─── Fused Multi-Head Attention ──────────────────────────────────────
+
+    struct FusedAttentionParams {
+        uint32_t num_heads;
+        uint32_t num_kv_heads;
+        uint32_t head_dim_q;
+        uint32_t head_dim_kv;
+        uint32_t dot_dim;
+        uint32_t out_head_dim;
+        uint32_t seq_len;
+        uint32_t kv_dim;
+        float    scale;
+    };
+
+    /// ALL heads in ONE dispatch. KV cache is FP16 (uint16 buffers).
+    bool fused_attention_decode(buffer_id buf_Q, buffer_id buf_K_cache,
+                                buffer_id buf_V_cache, buffer_id buf_output,
+                                const FusedAttentionParams& params);
+
     // ─── Attention ─────────────────────────────────────────────────────────
 
     /// Single-query decode attention over all KV.
