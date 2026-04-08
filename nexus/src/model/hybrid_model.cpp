@@ -450,9 +450,10 @@ std::unique_ptr<HybridModel> HybridModel::create(
         // Cap max_seq_len for KV cache to avoid OOM (use 4096 for initial testing)
         int effective_seq = std::min(static_cast<int>(m.manifest.max_seq_len), 4096);
         m.max_seq_len = effective_seq;
-        size_t kv_bytes = static_cast<size_t>(effective_seq) * kv_dim * sizeof(float);
-        m.kv_cache[i].keys = static_cast<float*>(memory.alloc_pages(kv_bytes));
-        m.kv_cache[i].values = static_cast<float*>(memory.alloc_pages(kv_bytes));
+        // FP16 KV cache: 2x less memory than FP32 (halves bandwidth during attention)
+        size_t kv_bytes = static_cast<size_t>(effective_seq) * kv_dim * sizeof(uint16_t);
+        m.kv_cache[i].keys = static_cast<uint16_t*>(memory.alloc_pages(kv_bytes));
+        m.kv_cache[i].values = static_cast<uint16_t*>(memory.alloc_pages(kv_bytes));
         m.kv_cache[i].seq_len = 0;
     }
 
@@ -1313,12 +1314,14 @@ void HybridModel::Impl::gqa_attention(const float* q, int q_dim,
     // to avoid writing past the allocated cache.
     int store_kv_dim = std::min(kv_dim, kv.kv_dim);
 
-    // Store K, V in cache
+    // Store K, V in FP16 cache (convert FP32 → FP16 on write)
     if (kv.keys && kv.values && seq_pos < max_seq_len && store_kv_dim > 0) {
-        memcpy(kv.keys + seq_pos * kv.kv_dim, k_new,
-               store_kv_dim * sizeof(float));
-        memcpy(kv.values + seq_pos * kv.kv_dim, v_new,
-               store_kv_dim * sizeof(float));
+        uint16_t* k_dst = kv.keys + seq_pos * kv.kv_dim;
+        uint16_t* v_dst = kv.values + seq_pos * kv.kv_dim;
+        for (int i = 0; i < store_kv_dim; i++) {
+            k_dst[i] = HybridKVCache::f32_to_f16(k_new[i]);
+            v_dst[i] = HybridKVCache::f32_to_f16(v_new[i]);
+        }
         kv.seq_len = seq_pos + 1;
     }
 
@@ -1358,10 +1361,11 @@ void HybridModel::Impl::gqa_attention(const float* q, int q_dim,
 
         std::vector<float> scores(seq_len);
         for (int t = 0; t < seq_len; t++) {
-            const float* k_t = kv.keys + t * kv.kv_dim + kv_h * head_dim_kv;
+            // Read K from FP16 cache, convert on the fly
+            const uint16_t* k_t_fp16 = kv.keys + t * kv.kv_dim + kv_h * head_dim_kv;
             float dot = 0.0f;
             for (int d = 0; d < dot_dim; d++) {
-                dot += q_head[d] * k_t[d];
+                dot += q_head[d] * HybridKVCache::f16_to_f32(k_t_fp16[d]);
             }
             scores[t] = dot * scale;
             if (scores[t] > max_score) max_score = scores[t];
@@ -1379,12 +1383,12 @@ void HybridModel::Impl::gqa_attention(const float* q, int q_dim,
             }
         }
 
-        // Weighted sum of values — pack into [h * out_head_dim] slot
+        // Weighted sum of values — read V from FP16 cache
         float* out_head = attn_out.data() + h * out_head_dim;
         for (int t = 0; t < seq_len; t++) {
-            const float* v_t = kv.values + t * kv.kv_dim + kv_h * head_dim_kv;
+            const uint16_t* v_t_fp16 = kv.values + t * kv.kv_dim + kv_h * head_dim_kv;
             for (int d = 0; d < out_head_dim; d++) {
-                out_head[d] += scores[t] * v_t[d];
+                out_head[d] += scores[t] * HybridKVCache::f16_to_f32(v_t_fp16[d]);
             }
         }
     }

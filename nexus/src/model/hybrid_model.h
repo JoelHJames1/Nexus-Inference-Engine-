@@ -17,6 +17,8 @@
 #include "model/moe_router.h"
 #include <memory>
 #include <vector>
+#include <cstdint>
+#include <cstring>
 
 namespace nexus {
 
@@ -112,10 +114,30 @@ struct HybridLayerWeights {
 
 /// KV cache entry for attention layers (Type B) and simplified attention (Type A).
 struct HybridKVCache {
-    float* keys = nullptr;     // [max_seq, kv_dim]
-    float* values = nullptr;   // [max_seq, kv_dim]
+    uint16_t* keys = nullptr;   // [max_seq, kv_dim] FP16 (halves memory vs FP32)
+    uint16_t* values = nullptr; // [max_seq, kv_dim] FP16
     int    seq_len = 0;
-    int    kv_dim = 0;         // Actual KV dimension for this layer
+    int    kv_dim = 0;
+
+    // FP32↔FP16 conversion helpers (inlined for speed)
+    static inline uint16_t f32_to_f16(float f) {
+        uint32_t x; memcpy(&x, &f, 4);
+        uint32_t sign = (x >> 16) & 0x8000;
+        int exp = ((x >> 23) & 0xFF) - 127 + 15;
+        uint32_t mant = (x >> 13) & 0x3FF;
+        if (exp <= 0) return sign;
+        if (exp >= 31) return sign | 0x7C00;
+        return sign | (exp << 10) | mant;
+    }
+    static inline float f16_to_f32(uint16_t h) {
+        uint32_t sign = (h & 0x8000) << 16;
+        uint32_t exp = (h >> 10) & 0x1F;
+        uint32_t mant = h & 0x3FF;
+        if (exp == 0) { uint32_t r = sign; float f; memcpy(&f, &r, 4); return f; }
+        if (exp == 31) { uint32_t r = sign | 0x7F800000 | (mant << 13); float f; memcpy(&f, &r, 4); return f; }
+        uint32_t r = sign | ((exp + 112) << 23) | (mant << 13);
+        float f; memcpy(&f, &r, 4); return f;
+    }
 };
 
 /// Hybrid model supporting Qwen3-Coder-Next's mixed SSM+Attention architecture.
