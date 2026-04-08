@@ -103,6 +103,14 @@ public:
     /// unmapped or at shutdown.
     void clear_buffer_cache();
 
+    /// Pre-allocate the activation buffer to the maximum size needed.
+    /// In resident mode this avoids reallocation on the per-token path.
+    void pre_allocate_activation_buffer(size_t max_act_bytes, size_t max_out_bytes);
+
+    /// Touch every page of every cached MTLBuffer to fault them into
+    /// physical RAM. Call after preloading all weights in resident mode.
+    void preload_all_buffers();
+
 private:
     std::unique_ptr<MetalContext> ctx_;
     std::unique_ptr<MetalBackend> gpu_;

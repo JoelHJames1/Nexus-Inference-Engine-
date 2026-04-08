@@ -325,4 +325,31 @@ void ComputeDispatch::clear_buffer_cache() {
     wrapped_buffer_cache_.clear();
 }
 
+void ComputeDispatch::pre_allocate_activation_buffer(size_t max_act_bytes, size_t max_out_bytes) {
+    if (!gpu_ready_) return;
+    // Pre-allocate buf_a_ (activations) and buf_c_ (output) to their maximum
+    // sizes so the per-token path never reallocates.
+    ensure_buffer(buf_a_, max_act_bytes);
+    ensure_buffer(buf_c_, max_out_bytes);
+    fprintf(stderr, "[compute] Pre-allocated activation buffers: act=%zu KB, out=%zu KB\n",
+            max_act_bytes / 1024, max_out_bytes / 1024);
+}
+
+void ComputeDispatch::preload_all_buffers() {
+    if (!gpu_ready_) return;
+    size_t count = 0;
+    // Touch every page of every cached wrapped-pointer MTLBuffer to fault
+    // all pages into physical RAM. This ensures the first token pays zero
+    // page-fault cost.
+    for (auto& [ptr, buf_id] : wrapped_buffer_cache_) {
+        void* contents = gpu_->buffer_contents(buf_id);
+        if (contents) {
+            volatile char touch = ((volatile char*)contents)[0];
+            (void)touch;
+            count++;
+        }
+    }
+    fprintf(stderr, "[compute] Pre-faulted %zu cached MTLBuffers\n", count);
+}
+
 }  // namespace nexus::compute

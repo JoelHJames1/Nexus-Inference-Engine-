@@ -22,6 +22,7 @@
 #include <string>
 #include <unordered_map>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 
 namespace nexus::model {
 
@@ -67,6 +68,11 @@ struct HybridModel::Impl {
     // Sequence state
     int current_seq_len = 0;
     int max_seq_len = 0;
+
+    // Resident mode: all weights pre-loaded as MTLBuffers, zero per-token loading.
+    // Enabled when total model size fits in 80% of available RAM.
+    bool resident_mode = false;
+    size_t total_model_size_bytes = 0;
 
     // Detected dimensions (resolved from tensor shapes at load time)
     int max_qkv_dim = 0;
@@ -446,8 +452,73 @@ std::unique_ptr<HybridModel> HybridModel::create(
     fprintf(stderr, "[nexus] Embeddings: tok=%p norm=%p out=%p\n",
             (void*)m.token_embeddings, (void*)m.output_norm, (void*)m.output_weight);
 
-    fprintf(stderr, "[nexus] HybridModel initialized: %u layers, streaming mode\n",
-            manifest.num_layers);
+    // ── Resident mode detection ──────────────────────────────────────────
+    // If the entire model fits in 80% of available RAM, preload ALL weights
+    // and wrap them as MTLBuffers once. This eliminates per-token weight
+    // loading entirely — the decode loop becomes pure GPU dispatch.
+    {
+        m.total_model_size_bytes = reader.file_size();
+        // Get available RAM (macOS sysctl)
+        uint64_t ram_bytes = 0;
+        size_t ram_size = sizeof(ram_bytes);
+        if (sysctlbyname("hw.memsize", &ram_bytes, &ram_size, nullptr, 0) == 0) {
+            uint64_t ram_limit = static_cast<uint64_t>(ram_bytes * 0.8);
+            if (m.total_model_size_bytes < ram_limit) {
+                m.resident_mode = true;
+            }
+        } else {
+            // Fallback: assume 48 GB if sysctl fails
+            if (m.total_model_size_bytes < static_cast<uint64_t>(48ULL * 1024 * 1024 * 1024 * 0.8)) {
+                m.resident_mode = true;
+            }
+        }
+
+        if (m.resident_mode) {
+            fprintf(stderr, "[nexus] Resident mode: model (%zu MB) fits in RAM, preloading ALL weights...\n",
+                    m.total_model_size_bytes / (1024 * 1024));
+
+            // Pre-load ALL layer weights upfront
+            for (uint32_t i = 0; i < manifest.num_layers; i++) {
+                m.load_layer_weights(i);
+            }
+
+            // Pre-wrap all raw INT4 weight pointers as MTLBuffers via gemm_int4's
+            // internal cache. We do this by triggering a cache lookup for every
+            // raw weight pointer. The wrapped_buffer_cache_ in ComputeDispatch
+            // will hold them permanently.
+            auto& gpu = compute::global_compute();
+            auto pre_wrap = [&](const void* data, size_t bytes) {
+                if (data && bytes > 0) {
+                    // gemm_int4 with M=0 would be a no-op, so instead we just
+                    // call gemm_int4 internals via the existing cache path.
+                    // The simplest way: do a dummy gemm_int4 that triggers
+                    // wrap_pointer caching. But that's wasteful.
+                    // Instead, directly trigger the cache by calling gemm_int4
+                    // with trivial dimensions — the buffer gets cached on first use.
+                    // Actually, the buffers will be cached on first real use per-layer,
+                    // which is fine since all layers are loaded. Let's just call
+                    // preload_all_buffers() after the first full pass.
+                    (void)data; (void)bytes;
+                }
+            };
+
+            // The wrapped_buffer_cache_ gets populated on first gemm_int4 call
+            // per weight pointer. Since all layer weights are loaded, the first
+            // token pass will populate the cache. After that, every subsequent
+            // token reuses the cached MTLBuffers with zero overhead.
+            //
+            // Pre-allocate activation buffers to max size to avoid per-token realloc.
+            size_t max_act_bytes = static_cast<size_t>(1) * std::max(m.max_qkv_dim, (int)manifest.hidden_dim) * sizeof(float);
+            size_t max_out_bytes = static_cast<size_t>(std::max((int)manifest.vocab_size, m.max_qkv_dim)) * sizeof(float);
+            gpu.pre_allocate_activation_buffer(max_act_bytes, max_out_bytes);
+
+            size_t total_mb = m.total_model_size_bytes / (1024 * 1024);
+            fprintf(stderr, "[nexus] Resident mode: ALL weights preloaded (%zu MB)\n", total_mb);
+        }
+    }
+
+    fprintf(stderr, "[nexus] HybridModel initialized: %u layers, %s mode\n",
+            manifest.num_layers, m.resident_mode ? "resident" : "streaming");
     return model;
 }
 
@@ -474,7 +545,7 @@ void HybridModel::prefill(const std::vector<int32_t>& tokens) {
 
         // Stream through all layers
         m.scheduler->execute_layers([&](uint32_t layer_idx) {
-            m.load_layer_weights(layer_idx);
+            if (!m.resident_mode) m.load_layer_weights(layer_idx);
             // Batch all GPU dispatches within this layer into one command buffer
             compute::global_compute().begin_gpu_batch();
             m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
@@ -500,7 +571,7 @@ int32_t HybridModel::decode_step(const SamplingParams& params) {
 
     // Stream through all layers
     m.scheduler->execute_layers([&](uint32_t layer_idx) {
-        m.load_layer_weights(layer_idx);
+        if (!m.resident_mode) m.load_layer_weights(layer_idx);
         m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
     });
 

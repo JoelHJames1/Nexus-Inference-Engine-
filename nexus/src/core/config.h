@@ -30,6 +30,9 @@ enum class Codec : uint8_t {
     AQLM2    = 8,     // AQLM 2-bit additive codebooks
     ANS      = 9,     // Entropy coded (post-quant lossless)
     TURBO_Q  = 10,    // TurboQuant (KV cache)
+    Q3K      = 11,    // Q3_K native passthrough (3.4 bits, no conversion)
+    Q4K      = 12,    // Q4_K native passthrough (4.5 bits)
+    Q2K      = 13,    // Q2_K native passthrough (2.6 bits)
 };
 
 // ─── Data types ─────────────────────────────────────────────────────────────
