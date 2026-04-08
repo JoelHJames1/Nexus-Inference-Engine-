@@ -97,6 +97,70 @@ public:
     /// End a GPU batch: commit the shared command buffer and synchronize.
     void end_gpu_batch();
 
+    // ─── GPU-Resident Activation Pipeline ─────────────────────────────────
+    // Keeps activations ON the GPU between GEMMs within a layer.
+    // Eliminates 420 CPU↔GPU round-trips per token (7 GEMMs × 60 layers).
+
+    /// Pre-allocated persistent GPU buffers for intermediate activations.
+    /// Allocated once at model load, reused every token. Activations NEVER
+    /// leave the GPU between GEMMs within a layer.
+    struct GPUBufferPool {
+        MetalBackend::buffer_id hidden;      // [hidden_dim] float
+        MetalBackend::buffer_id residual;    // [hidden_dim] float
+        MetalBackend::buffer_id norm_buf;    // [hidden_dim] float
+        MetalBackend::buffer_id q_buf;       // [max_q_dim] float
+        MetalBackend::buffer_id k_buf;       // [max_kv_dim] float
+        MetalBackend::buffer_id v_buf;       // [max_kv_dim] float
+        MetalBackend::buffer_id attn_out;    // [max_q_dim] float
+        MetalBackend::buffer_id ffn_gate;    // [max_ffn_dim] float
+        MetalBackend::buffer_id ffn_up;      // [max_ffn_dim] float
+        MetalBackend::buffer_id ffn_out;     // [hidden_dim] float
+        MetalBackend::buffer_id logits;      // [vocab_size] float
+    };
+
+    /// Allocate the GPU buffer pool once at model load time.
+    /// All buffers are persistent storageModeShared MTLBuffers that stay
+    /// allocated for the lifetime of the engine.
+    bool init_gpu_pool(uint32_t hidden_dim, uint32_t max_q_dim,
+                       uint32_t max_kv_dim, uint32_t max_ffn_dim,
+                       uint32_t vocab_size);
+
+    /// GPU-resident INT4 GEMV: input and output are GPU buffer IDs.
+    /// No CPU↔GPU copies — dispatches directly on resident buffers.
+    bool gemm_int4_gpu(MetalBackend::buffer_id buf_in,
+                       MetalBackend::buffer_id buf_weight,
+                       MetalBackend::buffer_id buf_out,
+                       uint32_t M, uint32_t N, uint32_t K);
+
+    /// Copy CPU data to a GPU pool buffer (called once at start of layer).
+    bool upload_to_gpu(const void* cpu_ptr, MetalBackend::buffer_id gpu_buf,
+                       size_t size);
+
+    /// Copy GPU pool buffer to CPU (called once at end of layer).
+    bool download_from_gpu(MetalBackend::buffer_id gpu_buf, void* cpu_ptr,
+                           size_t size);
+
+    /// Dispatch SwiGLU on GPU-resident buffers. Eliminates CPU SiLU+multiply.
+    bool gpu_swiglu(MetalBackend::buffer_id buf_gate,
+                    MetalBackend::buffer_id buf_up, uint32_t n);
+
+    /// Dispatch RMSNorm on GPU-resident buffers.
+    bool gpu_rmsnorm(MetalBackend::buffer_id buf_in,
+                     MetalBackend::buffer_id buf_weight,
+                     MetalBackend::buffer_id buf_out,
+                     uint32_t dim, float eps);
+
+    /// Dispatch residual add on GPU-resident buffers.
+    bool gpu_residual_add(MetalBackend::buffer_id buf_a,
+                          MetalBackend::buffer_id buf_b,
+                          MetalBackend::buffer_id buf_out, uint32_t n);
+
+    /// Access the GPU buffer pool (for callers that need specific buffer IDs).
+    const GPUBufferPool& gpu_pool() const { return gpu_pool_; }
+
+    /// Returns true if the GPU buffer pool has been initialized.
+    bool has_gpu_pool() const { return gpu_pool_ready_; }
+
     // ─── Buffer cache management ────────────────────────────────────────
 
     /// Clear the wrapped-pointer buffer cache. Call when model weights are
@@ -129,6 +193,11 @@ private:
     // Avoids recreating MTLBuffers for the same persistent pointers
     // across tokens (288 wrap_pointer + free_buffer calls per token).
     std::unordered_map<const void*, MetalBackend::buffer_id> wrapped_buffer_cache_;
+
+    // GPU-resident activation buffer pool
+    GPUBufferPool gpu_pool_{};
+    bool gpu_pool_ready_ = false;
+    void free_gpu_pool();
 };
 
 /// Global compute dispatcher (singleton-ish, set by Engine).

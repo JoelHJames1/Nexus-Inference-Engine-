@@ -30,6 +30,8 @@ void set_global_compute(ComputeDispatch* dispatch) {
 ComputeDispatch::ComputeDispatch() = default;
 
 ComputeDispatch::~ComputeDispatch() {
+    // Free GPU-resident activation pool before gpu_ is destroyed.
+    free_gpu_pool();
     // Clean up cached wrapped-pointer buffers before gpu_ is destroyed.
     clear_buffer_cache();
 }
@@ -265,6 +267,126 @@ void ComputeDispatch::batched_moe_ffn(
 
     // Fallback: zero output
     memset(output, 0, hidden_dim * sizeof(float));
+}
+
+// ─── GPU-Resident Activation Pipeline ───────────────────────────────────────
+
+void ComputeDispatch::free_gpu_pool() {
+    if (!gpu_pool_ready_ || !gpu_) return;
+    auto free = [&](MetalBackend::buffer_id& buf) {
+        if (buf) { gpu_->free_buffer(buf); buf = 0; }
+    };
+    free(gpu_pool_.hidden);
+    free(gpu_pool_.residual);
+    free(gpu_pool_.norm_buf);
+    free(gpu_pool_.q_buf);
+    free(gpu_pool_.k_buf);
+    free(gpu_pool_.v_buf);
+    free(gpu_pool_.attn_out);
+    free(gpu_pool_.ffn_gate);
+    free(gpu_pool_.ffn_up);
+    free(gpu_pool_.ffn_out);
+    free(gpu_pool_.logits);
+    gpu_pool_ready_ = false;
+}
+
+bool ComputeDispatch::init_gpu_pool(uint32_t hidden_dim, uint32_t max_q_dim,
+                                     uint32_t max_kv_dim, uint32_t max_ffn_dim,
+                                     uint32_t vocab_size) {
+    if (!gpu_ready_ || !gpu_) return false;
+
+    // Free any previous pool
+    free_gpu_pool();
+
+    // Helper: allocate a persistent shared buffer of the given float count.
+    auto alloc = [&](uint32_t float_count) -> MetalBackend::buffer_id {
+        return gpu_->alloc_shared_buffer(static_cast<size_t>(float_count) * sizeof(float));
+    };
+
+    gpu_pool_.hidden   = alloc(hidden_dim);
+    gpu_pool_.residual = alloc(hidden_dim);
+    gpu_pool_.norm_buf = alloc(hidden_dim);
+    gpu_pool_.q_buf    = alloc(max_q_dim);
+    gpu_pool_.k_buf    = alloc(max_kv_dim);
+    gpu_pool_.v_buf    = alloc(max_kv_dim);
+    gpu_pool_.attn_out = alloc(max_q_dim);
+    gpu_pool_.ffn_gate = alloc(max_ffn_dim);
+    gpu_pool_.ffn_up   = alloc(max_ffn_dim);
+    gpu_pool_.ffn_out  = alloc(hidden_dim);
+    gpu_pool_.logits   = alloc(vocab_size);
+
+    // Verify all allocations succeeded
+    if (!gpu_pool_.hidden || !gpu_pool_.residual || !gpu_pool_.norm_buf ||
+        !gpu_pool_.q_buf || !gpu_pool_.k_buf || !gpu_pool_.v_buf ||
+        !gpu_pool_.attn_out || !gpu_pool_.ffn_gate || !gpu_pool_.ffn_up ||
+        !gpu_pool_.ffn_out || !gpu_pool_.logits) {
+        fprintf(stderr, "[compute] GPU pool allocation failed — freeing partial pool\n");
+        free_gpu_pool();
+        return false;
+    }
+
+    gpu_pool_ready_ = true;
+
+    size_t total_bytes = (static_cast<size_t>(hidden_dim) * 4 +  // hidden, residual, norm_buf, ffn_out
+                          static_cast<size_t>(max_q_dim) * 2 +    // q_buf, attn_out
+                          static_cast<size_t>(max_kv_dim) * 2 +   // k_buf, v_buf
+                          static_cast<size_t>(max_ffn_dim) * 2 +  // ffn_gate, ffn_up
+                          static_cast<size_t>(vocab_size)) * sizeof(float);
+    fprintf(stderr, "[compute] GPU-resident activation pool: %.1f MB "
+            "(hidden=%u q=%u kv=%u ffn=%u vocab=%u)\n",
+            total_bytes / (1024.0 * 1024.0),
+            hidden_dim, max_q_dim, max_kv_dim, max_ffn_dim, vocab_size);
+    return true;
+}
+
+bool ComputeDispatch::gemm_int4_gpu(MetalBackend::buffer_id buf_in,
+                                     MetalBackend::buffer_id buf_weight,
+                                     MetalBackend::buffer_id buf_out,
+                                     uint32_t M, uint32_t N, uint32_t K) {
+    if (!gpu_ready_ || !gpu_) return false;
+    // Direct GPU-to-GPU dispatch — no CPU copies.
+    // M is always 1 for single-token decode, but we pass N and K to the shader.
+    return gpu_->gemm_int4_gpu(buf_in, buf_weight, buf_out, N, K);
+}
+
+bool ComputeDispatch::upload_to_gpu(const void* cpu_ptr,
+                                     MetalBackend::buffer_id gpu_buf,
+                                     size_t size) {
+    if (!gpu_ready_ || !gpu_ || !cpu_ptr || !gpu_buf) return false;
+    return gpu_->copy_to_buffer(gpu_buf, cpu_ptr, size);
+}
+
+bool ComputeDispatch::download_from_gpu(MetalBackend::buffer_id gpu_buf,
+                                         void* cpu_ptr, size_t size) {
+    if (!gpu_ready_ || !gpu_ || !cpu_ptr || !gpu_buf) return false;
+    void* gpu_ptr = gpu_->buffer_contents(gpu_buf);
+    if (!gpu_ptr) return false;
+    std::memcpy(cpu_ptr, gpu_ptr, size);
+    return true;
+}
+
+bool ComputeDispatch::gpu_swiglu(MetalBackend::buffer_id buf_gate,
+                                  MetalBackend::buffer_id buf_up, uint32_t n) {
+    if (!gpu_ready_ || !gpu_) return false;
+    // Dispatch swiglu_fused shader directly on GPU-resident buffers.
+    // Output overwrites buf_gate in-place (gate buffer becomes the result).
+    return gpu_->swiglu_fused(buf_gate, buf_up, buf_gate, n);
+}
+
+bool ComputeDispatch::gpu_rmsnorm(MetalBackend::buffer_id buf_in,
+                                   MetalBackend::buffer_id buf_weight,
+                                   MetalBackend::buffer_id buf_out,
+                                   uint32_t dim, float eps) {
+    if (!gpu_ready_ || !gpu_) return false;
+    return gpu_->rmsnorm(buf_in, buf_weight, buf_out, dim, eps);
+}
+
+bool ComputeDispatch::gpu_residual_add(MetalBackend::buffer_id buf_a,
+                                        MetalBackend::buffer_id buf_b,
+                                        MetalBackend::buffer_id buf_out,
+                                        uint32_t n) {
+    if (!gpu_ready_ || !gpu_) return false;
+    return gpu_->residual_add(buf_a, buf_b, buf_out, n);
 }
 
 // ─── Element-wise ops ───────────────────────────────────────────────────────

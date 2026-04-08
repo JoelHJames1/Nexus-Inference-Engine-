@@ -269,6 +269,68 @@ bool MetalBackend::gemv_int4_uniform(buffer_id buf_activations,
     return true;
 }
 
+// ─── GPU-Resident INT4 GEMV (zero-copy activation pipeline) ────────────────
+
+bool MetalBackend::gemm_int4_gpu(buffer_id buf_in, buffer_id buf_weight,
+                                  buffer_id buf_out, uint32_t N, uint32_t K)
+{
+    if (!is_ready()) return false;
+
+    // Same shader as gemv_int4_uniform but ALL buffers are already on-GPU.
+    // No copy_to_buffer, no buffer_contents, no memcpy — activations stay
+    // resident between GEMMs within a layer.
+    id<MTLComputePipelineState> pso = impl_->pipeline("gemv_int4_uniform");
+    if (!pso) return false;
+
+    auto [cb, enc] = impl_->begin_compute();
+    if (!enc) return false;
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:handle_to_buffer(buf_in) offset:0 atIndex:0];
+    [enc setBuffer:handle_to_buffer(buf_weight) offset:0 atIndex:1];
+    [enc setBuffer:handle_to_buffer(buf_out) offset:0 atIndex:2];
+
+    struct { uint32_t N; uint32_t K; } params = { N, K };
+    [enc setBytes:&params length:sizeof(params) atIndex:3];
+
+    NSUInteger tg = threadgroup_1d(pso);
+    MTLSize threadgroup_size = MTLSizeMake(tg, 1, 1);
+    MTLSize grid_size = MTLSizeMake((N + tg - 1) / tg, 1, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:threadgroup_size];
+
+    impl_->end_compute(cb, enc);
+    return true;
+}
+
+// ─── Residual Add ──────────────────────────────────────────────────────────
+
+bool MetalBackend::residual_add(buffer_id buf_a, buffer_id buf_b,
+                                buffer_id buf_output, uint32_t n)
+{
+    if (!is_ready()) return false;
+
+    id<MTLComputePipelineState> pso = impl_->pipeline("residual_add");
+    if (!pso) return false;
+
+    auto [cb, enc] = impl_->begin_compute();
+    if (!enc) return false;
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:handle_to_buffer(buf_a) offset:0 atIndex:0];
+    [enc setBuffer:handle_to_buffer(buf_b) offset:0 atIndex:1];
+    [enc setBuffer:handle_to_buffer(buf_output) offset:0 atIndex:2];
+    [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+
+    NSUInteger tg = threadgroup_1d(pso);
+    MTLSize threadgroup_size = MTLSizeMake(tg, 1, 1);
+    MTLSize grid_size = MTLSizeMake(ceil_div(n, (uint32_t)tg), 1, 1);
+
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:threadgroup_size];
+
+    impl_->end_compute(cb, enc);
+    return true;
+}
+
 // ─── RMSNorm ────────────────────────────────────────────────────────────────
 
 bool MetalBackend::rmsnorm(buffer_id buf_input, buffer_id buf_weight,

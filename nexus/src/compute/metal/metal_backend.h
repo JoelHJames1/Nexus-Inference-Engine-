@@ -62,6 +62,12 @@ public:
                            buffer_id buf_output,
                            uint32_t N, uint32_t K);
 
+    /// GPU-resident INT4 GEMV: all buffers are already on-GPU.
+    /// No CPU→GPU or GPU→CPU copies — activations stay resident between GEMMs.
+    /// This is the zero-copy fast path for the GPU-resident activation pipeline.
+    bool gemm_int4_gpu(buffer_id buf_in, buffer_id buf_weight,
+                       buffer_id buf_out, uint32_t N, uint32_t K);
+
     // ─── Normalization ─────────────────────────────────────────────────────
 
     /// RMSNorm:  output = input * weight / sqrt(mean(input^2) + eps)
@@ -75,6 +81,10 @@ public:
 
     /// Fused SwiGLU:  output = silu(gate) * up
     bool swiglu_fused(buffer_id buf_gate, buffer_id buf_up,
+                      buffer_id buf_output, uint32_t n);
+
+    /// Element-wise residual add:  output[i] = a[i] + b[i]
+    bool residual_add(buffer_id buf_a, buffer_id buf_b,
                       buffer_id buf_output, uint32_t n);
 
     // ─── Attention ─────────────────────────────────────────────────────────

@@ -514,6 +514,24 @@ std::unique_ptr<HybridModel> HybridModel::create(
         }
     }
 
+    // Initialize GPU buffer pool for GPU-resident activation pipeline
+    auto& gpu2 = compute::global_compute();
+    if (gpu2.has_gpu()) {
+        int max_q_dim = m.max_qkv_dim > 0 ? m.max_qkv_dim : manifest.hidden_dim * 4;
+        int max_kv_dim = manifest.num_kv_heads * manifest.head_dim;
+        if (max_kv_dim <= 0) max_kv_dim = manifest.hidden_dim;
+        int max_ffn_dim = 0;
+        // Scan for max FFN dim across layers
+        for (auto& lw : m.layer_weights) {
+            if (lw.ffn_dim > max_ffn_dim) max_ffn_dim = lw.ffn_dim;
+            if (lw.expert_ffn_dim > max_ffn_dim) max_ffn_dim = lw.expert_ffn_dim;
+        }
+        if (max_ffn_dim <= 0) max_ffn_dim = manifest.hidden_dim * 4;
+
+        gpu2.init_gpu_pool(manifest.hidden_dim, max_q_dim, max_kv_dim,
+                           max_ffn_dim, m.manifest.vocab_size);
+    }
+
     fprintf(stderr, "[nexus] HybridModel initialized: %u layers, %s mode\n",
             manifest.num_layers, m.resident_mode ? "resident" : "streaming");
     return model;
@@ -573,10 +591,13 @@ int32_t HybridModel::decode_step(const SamplingParams& params) {
         return -1;
     }
 
-    // Stream through all layers
+    // Stream through all layers — per-layer GPU batching reduces
+    // dispatch overhead within each layer's GEMM group.
     m.scheduler->execute_layers([&](uint32_t layer_idx) {
         if (!m.resident_mode) m.load_layer_weights(layer_idx);
+        compute::global_compute().begin_gpu_batch();
         m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
+        compute::global_compute().end_gpu_batch();
     });
 
     // Apply output norm
@@ -585,7 +606,7 @@ int32_t HybridModel::decode_step(const SamplingParams& params) {
                          m.manifest.hidden_dim, m.manifest.rms_norm_eps);
     }
 
-    // Compute logits: hidden_state @ output_weight^T -> logits
+    // Compute logits
     if (m.output_weight) {
         m.fused_gemm(m.hidden_state, m.output_weight, m.output_weight_raw,
                      m.logits, 1, m.manifest.vocab_size, m.manifest.hidden_dim);
