@@ -146,6 +146,14 @@ public:
         MetalBackend::buffer_id ffn_up;      // [max_ffn_dim] float
         MetalBackend::buffer_id ffn_out;     // [hidden_dim] float
         MetalBackend::buffer_id logits;      // [vocab_size] float
+
+        // GPU-resident KV cache: keeps K/V on GPU so attention never
+        // needs a flush/resume. Indexed as [layer * max_seq * kv_dim + pos * kv_dim].
+        MetalBackend::buffer_id kv_keys;     // [num_layers * max_seq * kv_dim] float
+        MetalBackend::buffer_id kv_values;   // [num_layers * max_seq * kv_dim] float
+        int kv_max_seq = 0;
+        int kv_dim = 0;
+        int kv_num_layers = 0;
     };
 
     /// Allocate the GPU buffer pool once at model load time.
@@ -154,6 +162,23 @@ public:
     bool init_gpu_pool(uint32_t hidden_dim, uint32_t max_q_dim,
                        uint32_t max_kv_dim, uint32_t max_ffn_dim,
                        uint32_t vocab_size);
+
+    /// Allocate the GPU-resident KV cache. Call after init_gpu_pool().
+    /// For decode (short sequences), this is manageable:
+    ///   e.g. 60 layers * 100 seq * 8192 kv_dim * 4 bytes = ~188 MB.
+    bool init_kv_cache(int num_layers, int max_seq, int kv_dim);
+
+    /// GPU-resident attention: Q/K/V and KV cache all stay on GPU.
+    /// No flush/resume needed — the entire attention runs as GPU dispatches.
+    /// Writes new K/V into the GPU KV cache at seq_pos, then computes
+    /// GQA attention over all cached KV, writing output to buf_output.
+    bool attention_gpu(MetalBackend::buffer_id buf_q,
+                       MetalBackend::buffer_id buf_new_k,
+                       MetalBackend::buffer_id buf_new_v,
+                       MetalBackend::buffer_id buf_output,
+                       int layer_idx, int seq_pos,
+                       int num_heads, int num_kv_heads,
+                       int head_dim_q, int head_dim_kv);
 
     /// GPU-resident INT4 GEMV: input and output are GPU buffer IDs.
     /// No CPU↔GPU copies — dispatches directly on resident buffers.

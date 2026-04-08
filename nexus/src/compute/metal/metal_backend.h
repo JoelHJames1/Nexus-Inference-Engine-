@@ -22,6 +22,19 @@ struct AttentionDecodeParams {
     float    scale;         // 1/sqrt(head_dim)
 };
 
+/// Parameters for the GPU-resident attention kernel.
+/// K/V cache lives entirely on GPU — no CPU round-trip needed.
+struct GPUAttentionParams {
+    uint32_t seq_len;       // Number of KV entries AFTER writing the new token
+    uint32_t num_heads;     // Number of query heads
+    uint32_t num_kv_heads;  // Number of KV heads (GQA)
+    uint32_t head_dim_q;    // Dimension per query head
+    uint32_t head_dim_kv;   // Dimension per KV head
+    float    scale;         // 1/sqrt(head_dim_q)
+    uint32_t seq_pos;       // Position to write new K/V in cache
+    uint32_t kv_stride;     // Stride between sequence positions in KV cache (= kv_dim)
+};
+
 class MetalBackend {
 public:
     /// Opaque buffer handle (cast of id<MTLBuffer>).
@@ -94,6 +107,15 @@ public:
     bool attention_decode(buffer_id buf_Q, buffer_id buf_K,
                           buffer_id buf_V, buffer_id buf_O,
                           const AttentionDecodeParams& params);
+
+    /// GPU-resident attention: reads KV from persistent GPU cache buffers.
+    /// Writes the new K/V at seq_pos, then computes GQA attention.
+    /// All buffers stay on GPU — no flush/resume needed.
+    bool attention_gpu(buffer_id buf_q, buffer_id buf_k_cache,
+                       buffer_id buf_v_cache,
+                       buffer_id buf_new_k, buffer_id buf_new_v,
+                       buffer_id buf_output,
+                       const GPUAttentionParams& params);
 
     // ─── Buffer management (UMA zero-copy) ─────────────────────────────────
 

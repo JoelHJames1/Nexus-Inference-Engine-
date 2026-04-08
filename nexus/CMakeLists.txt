@@ -169,6 +169,7 @@ set(METAL_SHADERS
     shaders/gemv_int4_fast.metal
     shaders/batched_expert_gemv.metal
     shaders/gemv_q3k.metal
+    shaders/attention_gpu.metal
 )
 
 set(METAL_AIR_FILES "")

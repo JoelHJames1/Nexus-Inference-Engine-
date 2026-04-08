@@ -290,6 +290,11 @@ void ComputeDispatch::free_gpu_pool() {
     free(gpu_pool_.ffn_up);
     free(gpu_pool_.ffn_out);
     free(gpu_pool_.logits);
+    free(gpu_pool_.kv_keys);
+    free(gpu_pool_.kv_values);
+    gpu_pool_.kv_max_seq = 0;
+    gpu_pool_.kv_dim = 0;
+    gpu_pool_.kv_num_layers = 0;
     gpu_pool_ready_ = false;
 }
 
@@ -340,6 +345,103 @@ bool ComputeDispatch::init_gpu_pool(uint32_t hidden_dim, uint32_t max_q_dim,
             total_bytes / (1024.0 * 1024.0),
             hidden_dim, max_q_dim, max_kv_dim, max_ffn_dim, vocab_size);
     return true;
+}
+
+bool ComputeDispatch::init_kv_cache(int num_layers, int max_seq, int kv_dim) {
+    if (!gpu_ready_ || !gpu_ || !gpu_pool_ready_) return false;
+
+    // Free any previous KV cache buffers
+    if (gpu_pool_.kv_keys) { gpu_->free_buffer(gpu_pool_.kv_keys); gpu_pool_.kv_keys = 0; }
+    if (gpu_pool_.kv_values) { gpu_->free_buffer(gpu_pool_.kv_values); gpu_pool_.kv_values = 0; }
+
+    size_t kv_buf_size = static_cast<size_t>(num_layers) * max_seq * kv_dim * sizeof(float);
+    gpu_pool_.kv_keys = gpu_->alloc_shared_buffer(kv_buf_size);
+    gpu_pool_.kv_values = gpu_->alloc_shared_buffer(kv_buf_size);
+
+    if (!gpu_pool_.kv_keys || !gpu_pool_.kv_values) {
+        fprintf(stderr, "[compute] GPU KV cache allocation failed (%.1f MB per buffer)\n",
+                kv_buf_size / (1024.0 * 1024.0));
+        if (gpu_pool_.kv_keys) { gpu_->free_buffer(gpu_pool_.kv_keys); gpu_pool_.kv_keys = 0; }
+        if (gpu_pool_.kv_values) { gpu_->free_buffer(gpu_pool_.kv_values); gpu_pool_.kv_values = 0; }
+        return false;
+    }
+
+    // Zero-initialize the cache (UMA: buffer_contents gives direct pointer)
+    void* k_ptr = gpu_->buffer_contents(gpu_pool_.kv_keys);
+    void* v_ptr = gpu_->buffer_contents(gpu_pool_.kv_values);
+    if (k_ptr) memset(k_ptr, 0, kv_buf_size);
+    if (v_ptr) memset(v_ptr, 0, kv_buf_size);
+
+    gpu_pool_.kv_max_seq = max_seq;
+    gpu_pool_.kv_dim = kv_dim;
+    gpu_pool_.kv_num_layers = num_layers;
+
+    fprintf(stderr, "[compute] GPU KV cache: %.1f MB "
+            "(layers=%d max_seq=%d kv_dim=%d, %.1f MB per buffer)\n",
+            2.0 * kv_buf_size / (1024.0 * 1024.0),
+            num_layers, max_seq, kv_dim, kv_buf_size / (1024.0 * 1024.0));
+    return true;
+}
+
+bool ComputeDispatch::attention_gpu(MetalBackend::buffer_id buf_q,
+                                     MetalBackend::buffer_id buf_new_k,
+                                     MetalBackend::buffer_id buf_new_v,
+                                     MetalBackend::buffer_id buf_output,
+                                     int layer_idx, int seq_pos,
+                                     int num_heads, int num_kv_heads,
+                                     int head_dim_q, int head_dim_kv) {
+    if (!gpu_ready_ || !gpu_ || !gpu_pool_ready_) return false;
+    if (!gpu_pool_.kv_keys || !gpu_pool_.kv_values) return false;
+    if (layer_idx >= gpu_pool_.kv_num_layers) return false;
+    if (seq_pos >= gpu_pool_.kv_max_seq) return false;
+
+    int kv_dim = gpu_pool_.kv_dim;
+
+    // Compute byte offset into the KV cache for this layer
+    size_t layer_offset = static_cast<size_t>(layer_idx) * gpu_pool_.kv_max_seq * kv_dim * sizeof(float);
+
+    // We need to pass the layer-specific slice of the KV cache.
+    // Since Metal buffers are contiguous, we use buffer offsets.
+    // However, attention_gpu on MetalBackend takes buffer_ids, not offsets.
+    // On UMA (storageModeShared), we can create sub-buffers or use wrap_pointer.
+    //
+    // Simpler: use wrap_pointer on the offset pointer.
+    // buffer_contents gives us the base pointer, we offset it.
+    void* k_base = gpu_->buffer_contents(gpu_pool_.kv_keys);
+    void* v_base = gpu_->buffer_contents(gpu_pool_.kv_values);
+    if (!k_base || !v_base) return false;
+
+    size_t layer_float_offset = static_cast<size_t>(layer_idx) * gpu_pool_.kv_max_seq * kv_dim;
+    float* k_layer_ptr = reinterpret_cast<float*>(k_base) + layer_float_offset;
+    float* v_layer_ptr = reinterpret_cast<float*>(v_base) + layer_float_offset;
+
+    size_t layer_buf_size = static_cast<size_t>(gpu_pool_.kv_max_seq) * kv_dim * sizeof(float);
+    MetalBackend::buffer_id buf_k_layer = gpu_->wrap_pointer(k_layer_ptr, layer_buf_size);
+    MetalBackend::buffer_id buf_v_layer = gpu_->wrap_pointer(v_layer_ptr, layer_buf_size);
+
+    if (!buf_k_layer || !buf_v_layer) {
+        if (buf_k_layer) gpu_->free_buffer(buf_k_layer);
+        if (buf_v_layer) gpu_->free_buffer(buf_v_layer);
+        return false;
+    }
+
+    GPUAttentionParams params;
+    params.seq_len = static_cast<uint32_t>(seq_pos + 1);  // Including the new token
+    params.num_heads = static_cast<uint32_t>(num_heads);
+    params.num_kv_heads = static_cast<uint32_t>(num_kv_heads);
+    params.head_dim_q = static_cast<uint32_t>(head_dim_q);
+    params.head_dim_kv = static_cast<uint32_t>(head_dim_kv);
+    params.scale = 1.0f / sqrtf(static_cast<float>(head_dim_q));
+    params.seq_pos = static_cast<uint32_t>(seq_pos);
+    params.kv_stride = static_cast<uint32_t>(kv_dim);
+
+    bool ok = gpu_->attention_gpu(buf_q, buf_k_layer, buf_v_layer,
+                                   buf_new_k, buf_new_v, buf_output, params);
+
+    gpu_->free_buffer(buf_k_layer);
+    gpu_->free_buffer(buf_v_layer);
+
+    return ok;
 }
 
 bool ComputeDispatch::gemm_int4_gpu(MetalBackend::buffer_id buf_in,

@@ -482,6 +482,95 @@ bool MetalBackend::attention_decode(buffer_id buf_Q, buffer_id buf_K,
     return true;
 }
 
+// ─── GPU-Resident Attention ─────────────────────────────────────────────────
+
+bool MetalBackend::attention_gpu(buffer_id buf_q, buffer_id buf_k_cache,
+                                  buffer_id buf_v_cache,
+                                  buffer_id buf_new_k, buffer_id buf_new_v,
+                                  buffer_id buf_output,
+                                  const GPUAttentionParams& params)
+{
+    if (!is_ready()) return false;
+
+    // ── Step 1: Update KV cache with new K/V at seq_pos ──
+    {
+        id<MTLComputePipelineState> pso = impl_->pipeline("attention_gpu_cache_update");
+        if (!pso) return false;
+
+        auto [cb, enc] = impl_->begin_compute();
+        if (!enc) return false;
+
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:handle_to_buffer(buf_new_k)   offset:0 atIndex:0];
+        [enc setBuffer:handle_to_buffer(buf_new_v)   offset:0 atIndex:1];
+        [enc setBuffer:handle_to_buffer(buf_k_cache) offset:0 atIndex:2];
+        [enc setBuffer:handle_to_buffer(buf_v_cache) offset:0 atIndex:3];
+
+        // Reuse the GPUAttentionParams struct — shader only reads seq_pos and kv_stride.
+        struct {
+            uint32_t seq_len;
+            uint32_t num_heads;
+            uint32_t num_kv_heads;
+            uint32_t head_dim_q;
+            uint32_t head_dim_kv;
+            float    scale;
+            uint32_t seq_pos;
+            uint32_t kv_stride;
+        } gpu_params = {
+            params.seq_len, params.num_heads, params.num_kv_heads,
+            params.head_dim_q, params.head_dim_kv, params.scale,
+            params.seq_pos, params.kv_stride
+        };
+        [enc setBytes:&gpu_params length:sizeof(gpu_params) atIndex:4];
+
+        NSUInteger tg = threadgroup_1d(pso);
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+
+        impl_->end_compute(cb, enc);
+    }
+
+    // ── Step 2: Compute GQA attention over full KV cache ──
+    {
+        id<MTLComputePipelineState> pso = impl_->pipeline("attention_gpu_decode");
+        if (!pso) return false;
+
+        auto [cb, enc] = impl_->begin_compute();
+        if (!enc) return false;
+
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:handle_to_buffer(buf_q)       offset:0 atIndex:0];
+        [enc setBuffer:handle_to_buffer(buf_k_cache) offset:0 atIndex:1];
+        [enc setBuffer:handle_to_buffer(buf_v_cache) offset:0 atIndex:2];
+        [enc setBuffer:handle_to_buffer(buf_output)  offset:0 atIndex:3];
+
+        struct {
+            uint32_t seq_len;
+            uint32_t num_heads;
+            uint32_t num_kv_heads;
+            uint32_t head_dim_q;
+            uint32_t head_dim_kv;
+            float    scale;
+            uint32_t seq_pos;
+            uint32_t kv_stride;
+        } gpu_params = {
+            params.seq_len, params.num_heads, params.num_kv_heads,
+            params.head_dim_q, params.head_dim_kv, params.scale,
+            params.seq_pos, params.kv_stride
+        };
+        [enc setBytes:&gpu_params length:sizeof(gpu_params) atIndex:4];
+
+        // One threadgroup per query head
+        NSUInteger tg = std::min<NSUInteger>([pso maxTotalThreadsPerThreadgroup], 256);
+        [enc dispatchThreadgroups:MTLSizeMake(params.num_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+
+        impl_->end_compute(cb, enc);
+    }
+
+    return true;
+}
+
 // ─── Buffer management (UMA zero-copy) ──────────────────────────────────────
 
 MetalBackend::buffer_id MetalBackend::alloc_shared_buffer(size_t bytes)
