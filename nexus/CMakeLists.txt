@@ -173,6 +173,7 @@ set(METAL_SHADERS
     shaders/fused_multihead_attention.metal
     shaders/fused_ffn_int4.metal
     shaders/fused_qkv_int4.metal
+    shaders/gemv_int4_nr8.metal
 )
 
 set(METAL_AIR_FILES "")

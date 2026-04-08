@@ -160,7 +160,8 @@ void ComputeDispatch::gemm_int4(const float* activations, const void* weights_in
 
         if (buf_w && buf_a && buf_out) {
             gpu_->copy_to_buffer(buf_a, activations, act_size);
-            if (gpu_->gemv_int4_uniform(buf_a, buf_w, buf_out, N, K)) {
+            // Use NR0=8 SIMD-cooperative GEMV (2-3x faster than naive per-thread)
+            if (gpu_->gemv_int4_nr8(buf_a, buf_w, buf_out, N, K)) {
                 void* result = gpu_->buffer_contents(buf_out);
                 if (result) {
                     memcpy(out, result, out_size);

@@ -602,6 +602,45 @@ bool MetalBackend::attention_gpu(buffer_id buf_q, buffer_id buf_k_cache,
     return true;
 }
 
+// ─── NR0=8 INT4 GEMV ────────────────────────────────────────────────────────
+
+bool MetalBackend::gemv_int4_nr8(buffer_id buf_activations,
+                                  buffer_id buf_weights_q,
+                                  buffer_id buf_output,
+                                  uint32_t N, uint32_t K)
+{
+    if (!is_ready()) return false;
+
+    id<MTLComputePipelineState> pso = impl_->pipeline("gemv_int4_nr8");
+    if (!pso) return false;
+
+    auto [cb, enc] = impl_->begin_compute();
+    if (!enc) return false;
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:handle_to_buffer(buf_activations) offset:0 atIndex:0];
+    [enc setBuffer:handle_to_buffer(buf_weights_q) offset:0 atIndex:1];
+    [enc setBuffer:handle_to_buffer(buf_output) offset:0 atIndex:2];
+
+    struct { uint32_t N; uint32_t K; } params = { N, K };
+    [enc setBytes:&params length:sizeof(params) atIndex:3];
+
+    // 4 SIMD groups per threadgroup (128 threads), each handles 8 rows
+    // Total SIMD groups needed: ceil(N / 8)
+    constexpr uint32_t SIMDS_PER_TG = 4;
+    constexpr uint32_t NR0 = 8;
+    constexpr uint32_t TG_SIZE = SIMDS_PER_TG * 32;  // 128 threads
+    uint32_t total_simd_groups = (N + NR0 - 1) / NR0;
+    uint32_t num_tg = (total_simd_groups + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+
+    MTLSize threadgroup_size = MTLSizeMake(TG_SIZE, 1, 1);
+    MTLSize grid_size = MTLSizeMake(num_tg, 1, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:threadgroup_size];
+
+    impl_->end_compute(cb, enc);
+    return true;
+}
+
 // ─── Fused QKV (RMSNorm + Q + K + V projections) ───────────────────────────
 
 bool MetalBackend::fused_qkv_int4(buffer_id buf_hidden, buffer_id buf_norm_w,
