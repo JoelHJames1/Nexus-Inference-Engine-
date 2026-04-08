@@ -594,7 +594,9 @@ void HybridModel::prefill(const std::vector<int32_t>& tokens) {
             if (!m.resident_mode) m.load_layer_weights(layer_idx);
             // Batch all GPU dispatches within this layer into one command buffer
             compute::global_compute().begin_gpu_batch();
-            m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
+            compute::global_compute().begin_gpu_batch();
+        m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
+        compute::global_compute().end_gpu_batch();
             compute::global_compute().end_gpu_batch();
         });
 
@@ -926,9 +928,9 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
     // wo shape is [wo_input_dim, hidden_dim]. For Qwen3: [4096, 2048].
     // attn_output contains n_heads * head_dim_kv = 4096 elements.
     if (lw.wo) {
-        // Determine wo input dimension from tensor shape
-        int wo_in_dim = n_heads * head_dim;  // 16 * 256 = 4096
-        if (wo_in_dim <= 0) wo_in_dim = q_dim;  // fallback
+        int wo_in_dim = n_heads * head_dim;
+        if (wo_in_dim <= 0) wo_in_dim = q_dim;
+
         fused_gemm(attn_output, lw.wo, lw.wo_raw, ffn_output, 1, dim, wo_in_dim);
         memcpy(attn_output, ffn_output, dim * sizeof(float));
     } else {
@@ -1101,11 +1103,9 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
                     // out = gate_buf @ w2 (GPU-resident)
                     gpu.gemm_int4_gpu(pool.ffn_gate, buf_w2, pool.ffn_out, 1, dim, ffn);
 
-                    // Flush GPU batch before reading result
+                    // Flush batch to commit GPU work, then download
                     gpu.end_gpu_batch();
-                    // Download result
                     gpu.download_from_gpu(pool.ffn_out, out, dim * sizeof(float));
-                    // Restart batch for remaining layer ops
                     gpu.begin_gpu_batch();
                     return;
                 }
