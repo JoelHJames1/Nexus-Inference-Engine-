@@ -66,6 +66,16 @@ struct HybridLayerWeights {
     float* expert_w3 = nullptr;           // [num_experts, hidden_dim, expert_ffn_dim] — up proj
     float* shared_expert_gate = nullptr;  // [hidden_dim] — shared expert gating
 
+    // Raw mapped INT4 base pointers for on-demand expert slicing.
+    // These point to the full [num_experts, ...] packed INT4 data in the NXF.
+    // Per-expert slicing and dequant happens in moe_ffn().
+    const uint8_t* expert_w1_raw = nullptr;  // mapped INT4 for w1 [num_experts, hidden_dim, ffn_dim]
+    const uint8_t* expert_w2_raw = nullptr;  // mapped INT4 for w2 [num_experts, ffn_dim, hidden_dim]
+    const uint8_t* expert_w3_raw = nullptr;  // mapped INT4 for w3 [num_experts, hidden_dim, ffn_dim]
+    size_t expert_w1_bytes = 0;              // total mapped size for bounds checking
+    size_t expert_w2_bytes = 0;
+    size_t expert_w3_bytes = 0;
+
     // Shape metadata read from tensor info (stored per-layer for flexibility)
     int qkv_out_dim = 0;                 // Output dimension of fused QKV
     int q_out_dim = 0;                   // Output dimension of separate Q

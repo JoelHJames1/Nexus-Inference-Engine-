@@ -4,6 +4,7 @@
 /// index, then writes each tensor into an NXF file via NXFWriter.
 
 #include "import/gguf_importer.h"
+#include "import/vocab_extractor.h"
 #include "format/nxf.h"
 #include "quant/gptq.h"
 
@@ -1240,6 +1241,33 @@ bool GGUFImporter::convert(const std::string& gguf_path,
 
     // Finalize NXF file
     writer->finalize();
+
+    // ─── Extract and save tokenizer vocabulary ────────────────────────────
+    {
+        VocabData vocab;
+        if (VocabExtractor::extract_from_gguf(gguf_fd, gguf, vocab)) {
+            // Derive output directory from nxf_path.
+            std::string out_dir;
+            size_t slash = nxf_path.find_last_of('/');
+            if (slash != std::string::npos) {
+                out_dir = nxf_path.substr(0, slash + 1);
+            } else {
+                out_dir = "./";
+            }
+
+            // Save vocab.txt next to the NXF file.
+            VocabExtractor::save_vocab_file(vocab.tokens, out_dir + "vocab.txt");
+
+            // Save merges.txt if merge rules were found.
+            if (!vocab.merges.empty()) {
+                VocabExtractor::save_merges_file(vocab.merges, out_dir + "merges.txt");
+            }
+
+            fprintf(stderr, "[nexus] Tokenizer vocabulary saved alongside NXF file\n");
+        } else {
+            fprintf(stderr, "[nexus] WARNING: Could not extract tokenizer vocabulary from GGUF\n");
+        }
+    }
 
     ::close(gguf_fd);
 

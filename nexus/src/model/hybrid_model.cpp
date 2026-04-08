@@ -666,24 +666,6 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
     auto& lw = layer_weights[layer_idx];
     int dim = manifest.hidden_dim;
 
-    // TODO: Fix Q/K dimension mismatch in GQA for this hybrid architecture.
-    // Q dim (8192) ≠ K dim (512) — need proper multi-head latent attention.
-    // For now, just apply norms as residual passthrough to keep all 48 layers running.
-    if (lw.attention_norm) {
-        compute::global_compute().rmsnorm(x, x, lw.attention_norm, dim, manifest.rms_norm_eps);
-    }
-    if (lw.post_attention_norm) {
-        compute::global_compute().rmsnorm(x, x, lw.post_attention_norm, dim, manifest.rms_norm_eps);
-    }
-    // MoE FFN (gate logits still work)
-    if (lw.moe_gate) {
-        float* moe_out = ffn_output;
-        moe_ffn(layer_idx, x, moe_out);
-        for (int i = 0; i < dim; i++) x[i] += moe_out[i];
-    }
-    return;
-
-    // ── Original attention code (disabled until dimension fix) ──
     // ── Save residual ──
     memcpy(residual, x, dim * sizeof(float));
 
@@ -769,16 +751,19 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
     }
 
     // ── Output projection ──
+    // wo shape is [wo_input_dim, hidden_dim]. For Qwen3: [4096, 2048].
+    // attn_output contains n_heads * head_dim_kv = 4096 elements.
     if (lw.wo) {
-        // wo: [q_dim, hidden_dim] — project attention output back to hidden_dim
-        // attn_output has size q_dim (from the attention heads), project to dim
+        // Determine wo input dimension from tensor shape
+        int wo_in_dim = n_heads * head_dim;  // 16 * 256 = 4096
+        if (wo_in_dim <= 0) wo_in_dim = q_dim;  // fallback
         compute::global_compute().gemm(attn_output, lw.wo, ffn_output,
-                         1, dim, q_dim);
+                         1, dim, wo_in_dim);
         memcpy(attn_output, ffn_output, dim * sizeof(float));
-    } else if (q_dim != dim) {
-        // No output projection but dimensions mismatch — truncate/pad
+    } else {
+        // No output projection — truncate/pad to hidden_dim
         if (q_dim > dim) {
-            // Truncate (already in attn_output, just ignore extra)
+            // attn_output already has the first `dim` values
         } else {
             memset(attn_output + q_dim, 0, (dim - q_dim) * sizeof(float));
         }
@@ -845,17 +830,18 @@ void HybridModel::Impl::gqa_attention(const float* q, int q_dim,
     int dot_dim = std::min(head_dim_q, head_dim_kv);
     dot_dim = std::min(dot_dim, head_dim);  // Also respect the passed head_dim
 
-    // Output accumulator — sized to q_dim (one output per Q head)
-    // We'll project back to hidden_dim via the output projection later.
-    std::vector<float> attn_out(q_dim, 0.0f);
+    // Output accumulator: n_heads × head_dim_kv (V's head dim).
+    // For Qwen3: 16 heads × 256 = 4096, matching wo input dim [4096, 2048].
+    int out_head_dim = head_dim_kv;
+    int total_out_dim = n_heads * out_head_dim;
+    std::vector<float> attn_out(total_out_dim, 0.0f);
 
     for (int h = 0; h < n_heads; h++) {
         int kv_h = h / heads_per_group;
-        if (kv_h >= n_kv_heads) kv_h = n_kv_heads - 1;  // Safety clamp
+        if (kv_h >= n_kv_heads) kv_h = n_kv_heads - 1;
 
         const float* q_head = q + h * head_dim_q;
 
-        // Compute attention scores
         float scale = 1.0f / sqrtf(static_cast<float>(dot_dim));
         float max_score = -1e30f;
         int seq_len = kv.seq_len;
@@ -887,25 +873,23 @@ void HybridModel::Impl::gqa_attention(const float* q, int q_dim,
             }
         }
 
-        // Weighted sum of values
-        // Output for this head uses head_dim_kv dimensions (V head dim)
-        float* out_head = attn_out.data() + h * head_dim_q;
+        // Weighted sum of values — pack into [h * out_head_dim] slot
+        float* out_head = attn_out.data() + h * out_head_dim;
         for (int t = 0; t < seq_len; t++) {
             const float* v_t = kv.values + t * kv.kv_dim + kv_h * head_dim_kv;
-            int copy_dim = std::min(head_dim_q, head_dim_kv);
-            for (int d = 0; d < copy_dim; d++) {
+            for (int d = 0; d < out_head_dim; d++) {
                 out_head[d] += scores[t] * v_t[d];
             }
         }
     }
 
-    // Copy attention output (q_dim) to the output buffer.
-    // The caller is responsible for applying the output projection to get
-    // back to hidden_dim if needed.
-    int copy_dim = std::min(q_dim, dim);
-    memcpy(out, attn_out.data(), copy_dim * sizeof(float));
-    if (copy_dim < dim) {
-        memset(out + copy_dim, 0, (dim - copy_dim) * sizeof(float));
+    // Copy attention output to the output buffer.
+    // total_out_dim = n_heads * head_dim_kv (e.g., 16 * 256 = 4096)
+    // This feeds into the output projection wo [4096, 2048].
+    int out_copy = std::min(total_out_dim, dim);
+    memcpy(out, attn_out.data(), out_copy * sizeof(float));
+    if (out_copy < dim) {
+        memset(out + out_copy, 0, (dim - out_copy) * sizeof(float));
     }
 }
 
@@ -928,8 +912,8 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
     int num_active = manifest.num_active_experts > 0 ? manifest.num_active_experts : 10;
     int expert_ffn = lw.expert_ffn_dim;
 
-    if (expert_ffn <= 0 || !lw.expert_w1 || !lw.expert_w2 || !lw.expert_w3) {
-        // Missing expert weights — skip
+    if (expert_ffn <= 0 || !lw.expert_w1_raw || !lw.expert_w2_raw || !lw.expert_w3_raw) {
+        // Missing expert weight mappings — skip
         return;
     }
 
@@ -973,14 +957,29 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
             gate_logits[expert_indices[i]] / active_sum : 1.0f / num_active;
     }
 
-    // ── Execute each active expert's SwiGLU FFN ──
-    // Expert weights layout: [num_experts, hidden_dim, expert_ffn_dim] for w1/w3
-    //                        [num_experts, expert_ffn_dim, hidden_dim] for w2
-    // Each expert e starts at offset e * hidden_dim * expert_ffn_dim in w1/w3
-    // and e * expert_ffn_dim * hidden_dim in w2.
-    size_t w1_expert_stride = static_cast<size_t>(dim) * expert_ffn;
-    size_t w2_expert_stride = static_cast<size_t>(expert_ffn) * dim;
-    size_t w3_expert_stride = w1_expert_stride;
+    // ── On-demand expert weight slicing and execution ──
+    // Expert weight tensors are stored as single INT4-packed NXF chunks:
+    //   w1: [num_experts, hidden_dim, expert_ffn_dim] — gate projection
+    //   w2: [num_experts, expert_ffn_dim, hidden_dim] — down projection
+    //   w3: [num_experts, hidden_dim, expert_ffn_dim] — up projection
+    //
+    // For expert E:
+    //   w1 slice: elements [E*dim*ffn .. (E+1)*dim*ffn), byte offset = E*dim*ffn/2
+    //   w2 slice: elements [E*ffn*dim .. (E+1)*ffn*dim), byte offset = E*ffn*dim/2
+    //   w3 slice: same layout as w1
+    //
+    // Each expert slice is ~1M elements = 500KB INT4 packed, dequants to 4MB FP32.
+    // With 10 active experts: 3 matrices * 4MB = 120MB total — very manageable.
+
+    size_t w1_elem_stride = static_cast<size_t>(dim) * expert_ffn;    // elements per expert in w1/w3
+    size_t w2_elem_stride = static_cast<size_t>(expert_ffn) * dim;    // elements per expert in w2
+    size_t w1_byte_stride = w1_elem_stride / 2;   // INT4: 2 elements per byte
+    size_t w2_byte_stride = w2_elem_stride / 2;
+
+    // Allocate dequant buffers for one expert at a time (reused across experts)
+    std::vector<float> w1_dequant(w1_elem_stride);
+    std::vector<float> w2_dequant(w2_elem_stride);
+    std::vector<float> w3_dequant(w1_elem_stride);
 
     std::vector<float> gate_buf(expert_ffn);
     std::vector<float> up_buf(expert_ffn);
@@ -990,13 +989,53 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
         int eid = expert_indices[i];
         float weight = expert_weights[i];
 
-        const float* w1 = lw.expert_w1 + eid * w1_expert_stride;
-        const float* w2 = lw.expert_w2 + eid * w2_expert_stride;
-        const float* w3 = lw.expert_w3 + eid * w3_expert_stride;
+        // ── Compute byte offsets for expert E's slice in packed INT4 data ──
+        size_t w1_byte_off = static_cast<size_t>(eid) * w1_byte_stride;
+        size_t w2_byte_off = static_cast<size_t>(eid) * w2_byte_stride;
+        size_t w3_byte_off = w1_byte_off;  // w3 has same layout as w1
+
+        // Bounds check before dequant
+        if (w1_byte_off + w1_byte_stride > lw.expert_w1_bytes ||
+            w2_byte_off + w2_byte_stride > lw.expert_w2_bytes ||
+            w3_byte_off + w1_byte_stride > lw.expert_w3_bytes) {
+            fprintf(stderr, "[nexus] WARNING: expert %d slice out of bounds in layer %u, skipping\n",
+                    eid, layer_idx);
+            continue;
+        }
+
+        // INT4 dequant for w1: each byte holds 2 elements (low nibble first)
+        {
+            const uint8_t* src = lw.expert_w1_raw + w1_byte_off;
+            for (size_t j = 0; j < w1_elem_stride; j += 2) {
+                uint8_t packed = src[j / 2];
+                w1_dequant[j]     = (static_cast<float>(packed & 0x0F) - 8.0f) / 8.0f;
+                w1_dequant[j + 1] = (static_cast<float>((packed >> 4) & 0x0F) - 8.0f) / 8.0f;
+            }
+        }
+
+        // INT4 dequant for w2
+        {
+            const uint8_t* src = lw.expert_w2_raw + w2_byte_off;
+            for (size_t j = 0; j < w2_elem_stride; j += 2) {
+                uint8_t packed = src[j / 2];
+                w2_dequant[j]     = (static_cast<float>(packed & 0x0F) - 8.0f) / 8.0f;
+                w2_dequant[j + 1] = (static_cast<float>((packed >> 4) & 0x0F) - 8.0f) / 8.0f;
+            }
+        }
+
+        // INT4 dequant for w3
+        {
+            const uint8_t* src = lw.expert_w3_raw + w3_byte_off;
+            for (size_t j = 0; j < w1_elem_stride; j += 2) {
+                uint8_t packed = src[j / 2];
+                w3_dequant[j]     = (static_cast<float>(packed & 0x0F) - 8.0f) / 8.0f;
+                w3_dequant[j + 1] = (static_cast<float>((packed >> 4) & 0x0F) - 8.0f) / 8.0f;
+            }
+        }
 
         // SwiGLU: out = (silu(x @ W1) * (x @ W3)) @ W2
-        compute::global_compute().gemm(x, w1, gate_buf.data(), 1, expert_ffn, dim);
-        compute::global_compute().gemm(x, w3, up_buf.data(), 1, expert_ffn, dim);
+        compute::global_compute().gemm(x, w1_dequant.data(), gate_buf.data(), 1, expert_ffn, dim);
+        compute::global_compute().gemm(x, w3_dequant.data(), up_buf.data(), 1, expert_ffn, dim);
 
         // SiLU on gate, elementwise multiply with up
         for (int j = 0; j < expert_ffn; j++) {
@@ -1005,7 +1044,7 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
         }
 
         // Down projection
-        compute::global_compute().gemm(gate_buf.data(), w2, expert_out.data(),
+        compute::global_compute().gemm(gate_buf.data(), w2_dequant.data(), expert_out.data(),
                          1, dim, expert_ffn);
 
         // Weighted accumulation into output
@@ -1058,10 +1097,31 @@ bool HybridModel::Impl::load_layer_weights(uint32_t layer_idx) {
         if (lw.expert_ffn_dim == 0) lw.expert_ffn_dim = 512;  // Qwen3-Coder-Next default
         if (lw.num_experts == 0) lw.num_experts = 512;
     }
-    // Expert w1/w2/w3 are NOT loaded here — loaded on-demand in moe_ffn()
-    lw.expert_w1 = nullptr;
+    // Expert w1/w2/w3: map the raw INT4 chunks (but do NOT dequantize the whole thing).
+    // Per-expert slicing + dequant happens on-demand in moe_ffn().
+    lw.expert_w1 = nullptr;  // FP32 full dequant not used
     lw.expert_w2 = nullptr;
     lw.expert_w3 = nullptr;
+    {
+        auto map_expert_raw = [&](const char* suffix, const uint8_t*& raw_ptr,
+                                   size_t& raw_bytes) {
+            std::string tname = layer_tensor_name(layer_idx, suffix);
+            const auto* tinfo = reader->get_tensor(tname);
+            if (!tinfo || tinfo->chunks.empty()) return;
+            const auto& chunk = tinfo->chunks[0];
+            const void* mapped = reader->map_chunk(chunk);
+            if (mapped) {
+                raw_ptr = static_cast<const uint8_t*>(mapped);
+                raw_bytes = chunk.compressed_size;
+            }
+        };
+        map_expert_raw("feed_forward.experts.w1.weight",
+                       lw.expert_w1_raw, lw.expert_w1_bytes);
+        map_expert_raw("feed_forward.experts.w2.weight",
+                       lw.expert_w2_raw, lw.expert_w2_bytes);
+        map_expert_raw("feed_forward.experts.w3.weight",
+                       lw.expert_w3_raw, lw.expert_w3_bytes);
+    }
     load("ffn_gate_inp_shexp.weight", lw.shared_expert_gate);
 
     // ── Type-specific weights ──
@@ -1184,6 +1244,12 @@ void HybridModel::Impl::evict_layer_weights(uint32_t layer_idx) {
     lw.expert_w1 = nullptr;
     lw.expert_w2 = nullptr;
     lw.expert_w3 = nullptr;
+    lw.expert_w1_raw = nullptr;
+    lw.expert_w2_raw = nullptr;
+    lw.expert_w3_raw = nullptr;
+    lw.expert_w1_bytes = 0;
+    lw.expert_w2_bytes = 0;
+    lw.expert_w3_bytes = 0;
     lw.shared_expert_gate = nullptr;
     lw.loaded = false;
 }

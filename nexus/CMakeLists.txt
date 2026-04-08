@@ -120,6 +120,10 @@ add_library(nexus_core STATIC
     # Core
     src/core/engine.cpp
     src/core/scheduler.cpp
+    src/core/tokenizer.cpp
+
+    # Vocab
+    src/import/vocab_extractor.cpp
 )
 
 target_include_directories(nexus_core PUBLIC

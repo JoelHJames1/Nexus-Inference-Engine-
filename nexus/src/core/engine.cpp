@@ -1,6 +1,7 @@
 /// NEXUS Engine — Top-level orchestrator implementation.
 
 #include "core/engine.h"
+#include "core/tokenizer.h"
 #include "memory/memory_manager.h"
 #include "model/transformer.h"
 #include "model/hybrid_model.h"
@@ -30,7 +31,9 @@ struct Engine::Impl {
     std::unique_ptr<model::Transformer> model;
     std::unique_ptr<model::HybridModel> hybrid_model;
     std::unique_ptr<compute::ComputeDispatch> compute;
+    Tokenizer tokenizer;
     format::ModelManifest manifest;
+    std::string model_path;
     bool using_hybrid = false;
 };
 
@@ -51,6 +54,7 @@ std::unique_ptr<Engine> Engine::create(const std::string& model_path,
     }
 
     engine->impl_->manifest = engine->impl_->reader->manifest();
+    engine->impl_->model_path = model_path;
     fprintf(stderr, "[nexus] Model: %s (%s)\n",
             engine->impl_->manifest.name.c_str(),
             engine->impl_->manifest.architecture.c_str());
@@ -60,6 +64,18 @@ std::unique_ptr<Engine> Engine::create(const std::string& model_path,
             engine->impl_->manifest.num_heads,
             engine->impl_->manifest.num_kv_heads,
             engine->impl_->manifest.vocab_size);
+
+    // Load tokenizer vocabulary from files adjacent to the model.
+    if (!engine->impl_->tokenizer.load_from_nxf_manifest(
+            engine->impl_->manifest, model_path)) {
+        fprintf(stderr, "[nexus] WARNING: No tokenizer vocabulary loaded; "
+                "using byte-level fallback.\n");
+        fprintf(stderr, "[nexus] To enable proper tokenization, run the GGUF "
+                "converter with --extract-vocab or place vocab.txt next to the model.\n");
+    } else {
+        fprintf(stderr, "[nexus] Tokenizer: %zu tokens loaded\n",
+                engine->impl_->tokenizer.vocab_size());
+    }
 
     // Initialize memory manager
     engine->impl_->memory = std::make_unique<MemoryManager>(config.memory);
@@ -174,10 +190,12 @@ std::string Engine::generate(const std::string& prompt,
 }
 
 std::vector<int32_t> Engine::tokenize(const std::string& text) const {
-    // TODO: Implement proper tokenizer (BPE/SentencePiece)
-    // For now, return a placeholder
+    if (impl_->tokenizer.is_loaded()) {
+        return impl_->tokenizer.encode(text);
+    }
+    // Byte-level fallback when no vocabulary is available.
     std::vector<int32_t> tokens;
-    // Simple byte-level fallback (will be replaced with real tokenizer)
+    tokens.reserve(text.size());
     for (unsigned char c : text) {
         tokens.push_back(static_cast<int32_t>(c));
     }
@@ -185,7 +203,10 @@ std::vector<int32_t> Engine::tokenize(const std::string& text) const {
 }
 
 std::string Engine::detokenize(const std::vector<int32_t>& tokens) const {
-    // TODO: Implement proper detokenizer
+    if (impl_->tokenizer.is_loaded()) {
+        return impl_->tokenizer.decode(tokens);
+    }
+    // Byte-level fallback when no vocabulary is available.
     std::string text;
     for (int32_t t : tokens) {
         if (t >= 0 && t < 256) {
