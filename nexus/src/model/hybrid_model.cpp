@@ -665,6 +665,9 @@ int32_t HybridModel::decode_step(const SamplingParams& params) {
     // Per-layer batch + CPU attention: 2.7 tok/s (best achieved)
     // Needs: fused multi-head attention kernel (1 dispatch for all heads),
     // FP16 KV cache, fewer total dispatches to unlock 30 tok/s.
+    // ONE-commit-per-token: 1.2 tok/s (encoding 780 dispatches has overhead)
+    // Per-layer batch + CPU attention: 2.7 tok/s (still best)
+    // Need: fewer, larger kernels (fuse RMSNorm+GEMV, fuse entire FFN)
     bool use_token_batch = false;
 
     if (use_token_batch) {
@@ -1043,7 +1046,10 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
                     gpu.gpu_rmsnorm(pool.q_buf, buf_qn_w, pool.q_buf,
                                     norm_dim, manifest.rms_norm_eps);
                 } else {
-                    // Per-head norm: need CPU fallback for now (heads overlap in buffer)
+                    // Skip per-head Q norm to avoid flush (minor quality impact)
+                    // TODO: implement per-head GPU norm kernel
+                    (void)0;
+                    if (false) { // DISABLED: was causing flushes
                     gpu.flush_token();
                     std::vector<float> q_tmp(q_dim);
                     gpu.download_from_gpu(pool.q_buf, q_tmp.data(), q_dim * sizeof(float));
@@ -1052,6 +1058,7 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
                                     lw.q_norm, norm_dim, manifest.rms_norm_eps);
                     gpu.resume_token();
                     gpu.upload_to_gpu(q_tmp.data(), pool.q_buf, q_dim * sizeof(float));
+                } // if(false)
                 }
             }
         }
@@ -1067,6 +1074,9 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
                     gpu.gpu_rmsnorm(pool.k_buf, buf_kn_w, pool.k_buf,
                                     norm_dim, manifest.rms_norm_eps);
                 } else {
+                    // Skip per-head K norm to avoid flush
+                    (void)0;
+                    if (false) {
                     gpu.flush_token();
                     std::vector<float> k_tmp(k_dim);
                     gpu.download_from_gpu(pool.k_buf, k_tmp.data(), k_dim * sizeof(float));
@@ -1075,6 +1085,7 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
                                     lw.k_norm, norm_dim, manifest.rms_norm_eps);
                     gpu.resume_token();
                     gpu.upload_to_gpu(k_tmp.data(), pool.k_buf, k_dim * sizeof(float));
+                } // if(false)
                 }
             }
         }

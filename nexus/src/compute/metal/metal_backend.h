@@ -100,6 +100,13 @@ public:
     bool residual_add(buffer_id buf_a, buffer_id buf_b,
                       buffer_id buf_output, uint32_t n);
 
+    /// GPU buffer-to-buffer copy via blit encoder.
+    /// Works correctly inside a persistent batch (inserts a barrier, uses
+    /// a blit pass, then resumes the compute encoder).
+    /// On UMA storageModeShared, this is a simple memcpy via the GPU command
+    /// stream, keeping the copy ordered with respect to prior dispatches.
+    bool buffer_copy(buffer_id src, buffer_id dst, size_t bytes);
+
     // ─── Fused Multi-Head Attention ──────────────────────────────────────
 
     struct FusedAttentionParams {

@@ -8,6 +8,7 @@
 #include "core/config.h"
 #include "compute/metal/metal_context.h"
 #include "compute/metal/metal_backend.h"
+#include <vector>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -221,6 +222,11 @@ public:
                           MetalBackend::buffer_id buf_b,
                           MetalBackend::buffer_id buf_out, uint32_t n);
 
+    /// GPU buffer-to-buffer copy (uses blit encoder, works inside token batch).
+    /// Correctly ordered with prior compute dispatches.
+    bool gpu_buffer_copy(MetalBackend::buffer_id src,
+                         MetalBackend::buffer_id dst, size_t bytes);
+
     /// Fused FFN: encode W1 GEMV + W3 GEMV + SwiGLU + W2 GEMV as 4 dispatches
     /// on ONE command buffer with memory barriers. Only 1 commit for the whole FFN.
     /// Input: activations on CPU. Output: result on CPU.
@@ -279,6 +285,12 @@ private:
     // Avoids recreating MTLBuffers for the same persistent pointers
     // across tokens (288 wrap_pointer + free_buffer calls per token).
     std::unordered_map<const void*, MetalBackend::buffer_id> wrapped_buffer_cache_;
+
+    // Pre-cached per-layer KV slice buffers for GPU-resident attention.
+    // Avoids wrap_pointer + free_buffer per layer per token inside the batch.
+    // Indexed by layer_idx. Allocated once in init_kv_cache.
+    std::vector<MetalBackend::buffer_id> kv_layer_k_bufs_;
+    std::vector<MetalBackend::buffer_id> kv_layer_v_bufs_;
 
     // GPU-resident activation buffer pool
     GPUBufferPool gpu_pool_{};

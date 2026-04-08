@@ -602,6 +602,47 @@ bool MetalBackend::attention_gpu(buffer_id buf_q, buffer_id buf_k_cache,
     return true;
 }
 
+// ─── GPU Buffer Copy (blit encoder) ────────────────────────────────────────
+
+bool MetalBackend::buffer_copy(buffer_id src, buffer_id dst, size_t bytes)
+{
+    if (!is_ready() || !src || !dst || bytes == 0) return false;
+
+    id<MTLBuffer> src_buf = handle_to_buffer(src);
+    id<MTLBuffer> dst_buf = handle_to_buffer(dst);
+
+    if ([src_buf length] < bytes || [dst_buf length] < bytes) return false;
+
+    if (impl_->persistent_mode && impl_->persistent_enc) {
+        // In batch mode: end the compute encoder, do a blit, start a new encoder.
+        [impl_->persistent_enc endEncoding];
+        impl_->persistent_enc = nil;
+
+        id<MTLBlitCommandEncoder> blit = [impl_->persistent_cb blitCommandEncoder];
+        [blit copyFromBuffer:src_buf sourceOffset:0
+                    toBuffer:dst_buf destinationOffset:0
+                        size:bytes];
+        [blit endEncoding];
+
+        // Resume compute encoder for subsequent dispatches.
+        impl_->persistent_enc = [impl_->persistent_cb computeCommandEncoder];
+    } else {
+        // Non-batch mode: create a one-shot command buffer with a blit.
+        auto* c = impl_->ci();
+        id<MTLCommandBuffer> cb = c->make_command_buffer();
+        if (!cb) return false;
+
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromBuffer:src_buf sourceOffset:0
+                    toBuffer:dst_buf destinationOffset:0
+                        size:bytes];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    return true;
+}
+
 // ─── Buffer management (UMA zero-copy) ──────────────────────────────────────
 
 MetalBackend::buffer_id MetalBackend::alloc_shared_buffer(size_t bytes)
