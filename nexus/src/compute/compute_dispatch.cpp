@@ -32,6 +32,13 @@ ComputeDispatch::ComputeDispatch() = default;
 ComputeDispatch::~ComputeDispatch() {
     // Free GPU-resident activation pool before gpu_ is destroyed.
     free_gpu_pool();
+    // Free small uploaded buffers (norm weights, etc.)
+    if (gpu_) {
+        for (auto& [ptr, buf_id] : small_buffer_cache_) {
+            gpu_->free_buffer(buf_id);
+        }
+    }
+    small_buffer_cache_.clear();
     // Clean up cached wrapped-pointer buffers before gpu_ is destroyed.
     clear_buffer_cache();
 }
@@ -392,32 +399,48 @@ bool ComputeDispatch::gpu_ffn_fused(const float* input, int hidden_dim,
                                      int ffn_dim, float* output) {
     if (!gpu_ready_ || !gpu_pool_ready_) return false;
 
-    // Upload input activation once
-    size_t in_size = hidden_dim * sizeof(float);
-    gpu_->copy_to_buffer(gpu_pool_.hidden, input, in_size);
+    // When in token-batch mode, activations are already in gpu_pool_.norm_buf
+    // and results stay in gpu_pool_.hidden (no CPU copies needed).
+    bool in_token = token_batch_active_;
 
-    // Start persistent batch — all 4 dispatches share one command buffer
-    gpu_->begin_batch();
+    if (!in_token) {
+        // Standalone FFN call: upload input activation
+        size_t in_size = hidden_dim * sizeof(float);
+        gpu_->copy_to_buffer(gpu_pool_.hidden, input, in_size);
 
-    // W1 GEMV: hidden → ffn_gate
-    gpu_->gemm_int4_gpu(gpu_pool_.hidden, buf_w1, gpu_pool_.ffn_gate, ffn_dim, hidden_dim);
-    // W3 GEMV: hidden → ffn_up (no barrier needed — reads same input, writes different output)
-    gpu_->gemm_int4_gpu(gpu_pool_.hidden, buf_w3, gpu_pool_.ffn_up, ffn_dim, hidden_dim);
+        // Start persistent batch — all 4 dispatches share one command buffer
+        gpu_->begin_batch();
+    }
+
+    // Use norm_buf as FFN input when in token-batch mode (already has post-norm data),
+    // otherwise use hidden (where we just uploaded the input).
+    auto ffn_input_buf = in_token ? gpu_pool_.norm_buf : gpu_pool_.hidden;
+
+    // W1 GEMV: input → ffn_gate
+    gpu_->gemm_int4_gpu(ffn_input_buf, buf_w1, gpu_pool_.ffn_gate, ffn_dim, hidden_dim);
+    // W3 GEMV: input → ffn_up
+    gpu_->gemm_int4_gpu(ffn_input_buf, buf_w3, gpu_pool_.ffn_up, ffn_dim, hidden_dim);
     // SwiGLU: ffn_gate = silu(ffn_gate) * ffn_up
     gpu_->swiglu_fused(gpu_pool_.ffn_gate, gpu_pool_.ffn_up, gpu_pool_.ffn_gate, ffn_dim);
     // W2 GEMV: ffn_gate → ffn_out
     gpu_->gemm_int4_gpu(gpu_pool_.ffn_gate, buf_w2, gpu_pool_.ffn_out, hidden_dim, ffn_dim);
 
-    // ONE commit for all 4 dispatches
-    gpu_->end_batch();
+    if (!in_token) {
+        // ONE commit for all 4 dispatches
+        gpu_->end_batch();
 
-    // Download result
-    void* result = gpu_->buffer_contents(gpu_pool_.ffn_out);
-    if (result) {
-        memcpy(output, result, hidden_dim * sizeof(float));
-        return true;
+        // Download result
+        void* result = gpu_->buffer_contents(gpu_pool_.ffn_out);
+        if (result) {
+            memcpy(output, result, hidden_dim * sizeof(float));
+            return true;
+        }
+        return false;
     }
-    return false;
+
+    // In token-batch mode: results stay on GPU in ffn_out buffer.
+    // Caller (execute_attention_moe_layer) will do the residual add on GPU.
+    return true;
 }
 
 MetalBackend::buffer_id ComputeDispatch::get_cached_buffer(const void* ptr) const {
@@ -462,14 +485,75 @@ void ComputeDispatch::softmax(float* data, int dim) {
 
 void ComputeDispatch::begin_gpu_batch() {
     if (gpu_ready_ && gpu_) {
+        // If we're in a token-level batch with an active command buffer,
+        // this is a no-op — the token batch owns the command buffer.
+        if (token_batch_encoding_) return;
         gpu_->begin_batch();
     }
 }
 
 void ComputeDispatch::end_gpu_batch() {
     if (gpu_ready_ && gpu_) {
+        // If we're in a token-level batch with an active command buffer,
+        // don't commit — the token batch's end_token() will handle it.
+        if (token_batch_encoding_) return;
         gpu_->end_batch();
     }
+}
+
+// ─── Token-level batching (single commit per token) ────────────────────────
+
+void ComputeDispatch::begin_token() {
+    if (!gpu_ready_ || !gpu_) return;
+    if (token_batch_active_) return;  // Already in token batch
+    token_batch_active_ = true;
+    token_batch_encoding_ = true;
+    gpu_->begin_batch();
+}
+
+void ComputeDispatch::end_token() {
+    if (!gpu_ready_ || !gpu_) return;
+    if (!token_batch_active_) return;
+    if (token_batch_encoding_) {
+        gpu_->end_batch();
+    }
+    token_batch_active_ = false;
+    token_batch_encoding_ = false;
+}
+
+void ComputeDispatch::flush_token() {
+    if (!gpu_ready_ || !gpu_ || !token_batch_active_) return;
+    if (token_batch_encoding_) {
+        // Commit current command buffer so GPU results are readable on CPU.
+        gpu_->end_batch();
+        token_batch_encoding_ = false;
+    }
+    // token_batch_active_ stays true — resume_token() will restart.
+}
+
+void ComputeDispatch::resume_token() {
+    if (!gpu_ready_ || !gpu_ || !token_batch_active_) return;
+    if (!token_batch_encoding_) {
+        // Start a new command buffer for the rest of this token.
+        gpu_->begin_batch();
+        token_batch_encoding_ = true;
+    }
+}
+
+MetalBackend::buffer_id ComputeDispatch::upload_small_buffer(const void* cpu_ptr,
+                                                              size_t bytes) {
+    if (!gpu_ready_ || !gpu_ || !cpu_ptr || bytes == 0) return 0;
+
+    // Check cache first
+    auto it = small_buffer_cache_.find(cpu_ptr);
+    if (it != small_buffer_cache_.end()) return it->second;
+
+    // Allocate and upload
+    auto buf = gpu_->alloc_shared_buffer(bytes);
+    if (!buf) return 0;
+    gpu_->copy_to_buffer(buf, cpu_ptr, bytes);
+    small_buffer_cache_[cpu_ptr] = buf;
+    return buf;
 }
 
 // ─── Buffer cache management ───────────────────────────────────────────────

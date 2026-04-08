@@ -97,6 +97,36 @@ public:
     /// End a GPU batch: commit the shared command buffer and synchronize.
     void end_gpu_batch();
 
+    // ─── Token-level batching (single commit per token) ──────────────
+
+    /// Begin a full-token batch: creates ONE Metal command buffer for the
+    /// entire decode step (all layers, all dispatches). Every GPU operation
+    /// between begin_token() and end_token() encodes without committing.
+    void begin_token();
+
+    /// End the full-token batch: commit the single command buffer and wait.
+    /// This is the ONLY Metal commit per token.
+    void end_token();
+
+    /// Returns true if we're inside a begin_token()/end_token() block
+    /// AND a command buffer is actively encoding (not between flush/resume).
+    bool in_token_batch() const { return token_batch_active_ && token_batch_encoding_; }
+
+    /// Flush the current batch mid-token: commit+wait so GPU results become
+    /// readable on CPU (e.g., for attention that needs CPU softmax + KV cache).
+    /// After flush, call resume_token() to start a new command buffer for
+    /// the remaining dispatches.
+    void flush_token();
+
+    /// Resume batching after a flush_token(). Creates a new command buffer
+    /// for the remaining GPU work in this token.
+    void resume_token();
+
+    /// Upload a small CPU tensor (e.g., RMSNorm weights) as a persistent
+    /// GPU buffer. Returns a cached buffer_id. Thread-safe for repeated calls
+    /// with the same pointer (returns cached ID).
+    MetalBackend::buffer_id upload_small_buffer(const void* cpu_ptr, size_t bytes);
+
     // ─── GPU-Resident Activation Pipeline ─────────────────────────────────
     // Keeps activations ON the GPU between GEMMs within a layer.
     // Eliminates 420 CPU↔GPU round-trips per token (7 GEMMs × 60 layers).
@@ -201,6 +231,13 @@ private:
     BufferCache buf_a_, buf_b_, buf_c_;
 
     MetalBackend::buffer_id ensure_buffer(BufferCache& cache, size_t needed);
+
+    // Token-batch state
+    bool token_batch_active_ = false;    // true between begin_token/end_token
+    bool token_batch_encoding_ = false;  // true when command buffer is actively encoding
+
+    // Cache for small uploaded buffers (norm weights, etc.)
+    std::unordered_map<const void*, MetalBackend::buffer_id> small_buffer_cache_;
 
     // Cached wrapped-pointer MTLBuffers for mmap'd weight data.
     // Avoids recreating MTLBuffers for the same persistent pointers

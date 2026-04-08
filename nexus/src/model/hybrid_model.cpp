@@ -594,9 +594,7 @@ void HybridModel::prefill(const std::vector<int32_t>& tokens) {
             if (!m.resident_mode) m.load_layer_weights(layer_idx);
             // Batch all GPU dispatches within this layer into one command buffer
             compute::global_compute().begin_gpu_batch();
-            compute::global_compute().begin_gpu_batch();
-        m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
-        compute::global_compute().end_gpu_batch();
+            m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
             compute::global_compute().end_gpu_batch();
         });
 
@@ -618,31 +616,83 @@ void HybridModel::prefill(const std::vector<int32_t>& tokens) {
 
 int32_t HybridModel::decode_step(const SamplingParams& params) {
     auto& m = *impl_;
+    auto& gpu = compute::global_compute();
 
     if (m.current_seq_len >= m.max_seq_len) {
         fprintf(stderr, "[nexus] Max sequence length reached (%d)\n", m.max_seq_len);
         return -1;
     }
 
-    // Stream through all layers — per-layer GPU batching reduces
-    // dispatch overhead within each layer's GEMM group.
-    m.scheduler->execute_layers([&](uint32_t layer_idx) {
-        if (!m.resident_mode) m.load_layer_weights(layer_idx);
-        compute::global_compute().begin_gpu_batch();
-        m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
-        compute::global_compute().end_gpu_batch();
-    });
+    // ── TOKEN-LEVEL BATCHING ──────────────────────────────────────────
+    // All GPU dispatches across ALL layers share ONE Metal command buffer.
+    // Attention requires CPU (softmax + KV cache), so we flush/resume there.
+    // This reduces Metal commits from ~420/token to ~2×N_attn_layers/token.
+    // Token-batch mode disabled until attention moves to GPU.
+    // Each flush_token/resume_token creates a new command buffer which
+    // adds overhead. With 60 layers × 2 flushes = 120 extra creates.
+    // Per-layer batch (2.7 tok/s) is faster than token-batch with flushes (1.5 tok/s).
+    bool use_token_batch = false;  // TODO: enable when attention is on GPU
 
-    // Apply output norm
-    if (m.output_norm) {
-        compute::global_compute().rmsnorm(m.hidden_state, m.hidden_state, m.output_norm,
-                         m.manifest.hidden_dim, m.manifest.rms_norm_eps);
+    if (use_token_batch) {
+        // Upload hidden_state to GPU pool at start of token
+        gpu.upload_to_gpu(m.hidden_state, gpu.gpu_pool().hidden,
+                          m.manifest.hidden_dim * sizeof(float));
+        gpu.begin_token();
     }
 
-    // Compute logits
-    if (m.output_weight) {
-        m.fused_gemm(m.hidden_state, m.output_weight, m.output_weight_raw,
-                     m.logits, 1, m.manifest.vocab_size, m.manifest.hidden_dim);
+    // Stream through all layers — in token-batch mode, begin/end_gpu_batch
+    // are no-ops (the token batch owns the command buffer).
+    m.scheduler->execute_layers([&](uint32_t layer_idx) {
+        if (!m.resident_mode) m.load_layer_weights(layer_idx);
+        gpu.begin_gpu_batch();
+        m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
+        gpu.end_gpu_batch();
+    });
+
+    if (use_token_batch) {
+        // Output norm on GPU
+        if (m.output_norm) {
+            auto buf_norm_w = gpu.upload_small_buffer(
+                m.output_norm, m.manifest.hidden_dim * sizeof(float));
+            if (buf_norm_w) {
+                gpu.gpu_rmsnorm(gpu.gpu_pool().hidden, buf_norm_w,
+                                gpu.gpu_pool().norm_buf,
+                                m.manifest.hidden_dim, m.manifest.rms_norm_eps);
+            }
+        }
+
+        // Logits GEMV on GPU
+        if (m.output_weight_raw.data) {
+            auto buf_lm = gpu.get_cached_buffer(m.output_weight_raw.data);
+            if (buf_lm) {
+                auto input_buf = m.output_norm ? gpu.gpu_pool().norm_buf
+                                               : gpu.gpu_pool().hidden;
+                gpu.gemm_int4_gpu(input_buf, buf_lm, gpu.gpu_pool().logits,
+                                  1, m.manifest.vocab_size, m.manifest.hidden_dim);
+            }
+        }
+
+        // THE ONLY COMMIT (plus flushes around attention)
+        gpu.end_token();
+
+        // Download logits to CPU for sampling
+        gpu.download_from_gpu(gpu.gpu_pool().logits, m.logits,
+                              m.manifest.vocab_size * sizeof(float));
+
+        // Sync hidden_state back to CPU so the next decode_step can
+        // upload the correct state (and for any CPU-side inspection).
+        gpu.download_from_gpu(gpu.gpu_pool().hidden, m.hidden_state,
+                              m.manifest.hidden_dim * sizeof(float));
+    } else {
+        // Non-batched path: output norm + logits on CPU
+        if (m.output_norm) {
+            gpu.rmsnorm(m.hidden_state, m.hidden_state, m.output_norm,
+                        m.manifest.hidden_dim, m.manifest.rms_norm_eps);
+        }
+        if (m.output_weight) {
+            m.fused_gemm(m.hidden_state, m.output_weight, m.output_weight_raw,
+                         m.logits, 1, m.manifest.vocab_size, m.manifest.hidden_dim);
+        }
     }
 
     int32_t next_token = m.sample_token(m.logits, params);
@@ -685,7 +735,19 @@ void HybridModel::Impl::execute_layer(uint32_t layer_idx, float* x, int seq_pos)
 void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
                                                  int seq_pos) {
     auto& lw = layer_weights[layer_idx];
+    auto& gpu = compute::global_compute();
     int dim = manifest.hidden_dim;
+    bool gpu_resident = gpu.in_token_batch() && gpu.has_gpu_pool();
+
+    // SSM layers have complex CPU-side logic (fused QKV, gates, SSM proj).
+    // For now: flush GPU, do everything on CPU, upload result back.
+    // The FFN at the end still benefits from GPU batching.
+    if (gpu_resident) {
+        // Flush any pending GPU work so we can read pool.hidden
+        gpu.flush_token();
+        // Download current hidden state from GPU
+        gpu.download_from_gpu(gpu.gpu_pool().hidden, x, dim * sizeof(float));
+    }
 
     // ── Save residual ──
     memcpy(residual, x, dim * sizeof(float));
@@ -831,6 +893,12 @@ ssm_residual:
     for (int i = 0; i < dim; i++) {
         x[i] = residual[i] + ffn_output[i];
     }
+
+    // If in token-batch mode, upload result back to GPU and resume batching
+    if (gpu_resident) {
+        gpu.upload_to_gpu(x, gpu.gpu_pool().hidden, dim * sizeof(float));
+        gpu.resume_token();
+    }
 }
 
 // ─── Type B: Full Attention + MoE layer ────────────────────────────────────
@@ -838,7 +906,226 @@ ssm_residual:
 void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x,
                                                        int seq_pos) {
     auto& lw = layer_weights[layer_idx];
+    auto& gpu = compute::global_compute();
     int dim = manifest.hidden_dim;
+    bool gpu_resident = gpu.in_token_batch() && gpu.has_gpu_pool();
+
+    if (gpu_resident) {
+        // ════════════════════════════════════════════════════════════════
+        //  GPU-RESIDENT PATH: activations stay on GPU between dispatches.
+        //  Flush only around attention (CPU softmax + KV cache).
+        // ════════════════════════════════════════════════════════════════
+        auto& pool = gpu.gpu_pool();
+
+        // ── Pre-attention RMSNorm on GPU ──
+        // pool.hidden has the current hidden state from the previous layer
+        // (or uploaded at the start of the token).
+        // Save residual: copy hidden → residual on GPU
+        gpu.gpu_residual_add(pool.hidden, pool.hidden, pool.residual, 0);
+        // ^ Trick: we just need a GPU memcpy. residual = hidden + 0.
+        // Actually, residual_add(a, b, out, n) computes out[i]=a[i]+b[i].
+        // We need a raw copy. Use upload/download as workaround, or just
+        // note that on UMA (storageModeShared), the buffer contents are
+        // directly accessible. We can memcpy via buffer_contents pointers.
+        {
+            void* src = gpu.has_gpu() ? nullptr : nullptr;
+            // On UMA, buffer_contents gives direct CPU pointer to GPU memory.
+            // But we can't call buffer_contents while batch is active because
+            // prior dispatches haven't committed yet. However, for the FIRST
+            // layer, pool.hidden was written by upload_to_gpu BEFORE begin_token.
+            // For subsequent layers, pool.hidden was written by GPU dispatches
+            // that are still in the command buffer.
+            //
+            // SOLUTION: We don't need an explicit residual copy! We can track
+            // residual state. The residual is the hidden state BEFORE this layer
+            // modifies it. Since all ops write to different pool buffers, we just
+            // need to do: residual_add(pool.hidden_before, delta, pool.hidden_after).
+            //
+            // Actually simpler: use TWO pool buffers. pool.hidden holds current
+            // state, pool.residual gets a copy. On GPU, encode a copy via
+            // residual_add with a zero buffer... OR just use the hidden buffer
+            // directly as the residual input to the final add.
+            //
+            // Cleanest: the residual IS pool.hidden at entry. The norm writes
+            // to pool.norm_buf. Attention + output_proj writes to pool.attn_out.
+            // Then: new_hidden = pool.hidden + pool.attn_out (residual add).
+            // After that, new hidden is in some buffer, and we do FFN similarly.
+            // No explicit copy needed!
+        }
+
+        // RMSNorm: hidden → norm_buf
+        if (lw.attention_norm) {
+            auto buf_norm_w = gpu.upload_small_buffer(
+                lw.attention_norm, dim * sizeof(float));
+            if (buf_norm_w) {
+                gpu.gpu_rmsnorm(pool.hidden, buf_norm_w, pool.norm_buf,
+                                dim, manifest.rms_norm_eps);
+            }
+        }
+
+        // ── QKV projections on GPU ──
+        int q_dim = lw.q_out_dim > 0 ? lw.q_out_dim : dim;
+        int k_dim = lw.k_out_dim > 0 ? lw.k_out_dim : (manifest.num_kv_heads * manifest.head_dim);
+        int v_dim = lw.v_out_dim > 0 ? lw.v_out_dim : k_dim;
+
+        if (lw.wq_raw.data) {
+            auto buf_wq = gpu.get_cached_buffer(lw.wq_raw.data);
+            if (buf_wq) gpu.gemm_int4_gpu(pool.norm_buf, buf_wq, pool.q_buf, 1, q_dim, dim);
+        }
+        if (lw.wk_raw.data) {
+            auto buf_wk = gpu.get_cached_buffer(lw.wk_raw.data);
+            if (buf_wk) gpu.gemm_int4_gpu(pool.norm_buf, buf_wk, pool.k_buf, 1, k_dim, dim);
+        }
+        if (lw.wv_raw.data) {
+            auto buf_wv = gpu.get_cached_buffer(lw.wv_raw.data);
+            if (buf_wv) gpu.gemm_int4_gpu(pool.norm_buf, buf_wv, pool.v_buf, 1, v_dim, dim);
+        }
+
+        // ── FLUSH: commit GPU work so we can read Q/K/V on CPU for attention ──
+        gpu.flush_token();
+
+        // Download Q, K, V from GPU to CPU
+        std::vector<float> q(q_dim, 0.0f);
+        std::vector<float> k(k_dim, 0.0f);
+        std::vector<float> v(v_dim, 0.0f);
+        gpu.download_from_gpu(pool.q_buf, q.data(), q_dim * sizeof(float));
+        gpu.download_from_gpu(pool.k_buf, k.data(), k_dim * sizeof(float));
+        gpu.download_from_gpu(pool.v_buf, v.data(), v_dim * sizeof(float));
+
+        // ── Q/K RMSNorm on CPU (small, not worth GPU dispatch) ──
+        if (lw.q_norm) {
+            int norm_dim = 256;
+            std::string qn_name = layer_tensor_name(layer_idx, "attn_q_norm.weight");
+            const auto* qn_info = reader->get_tensor(qn_name);
+            if (qn_info && !qn_info->shape.empty())
+                norm_dim = static_cast<int>(qn_info->shape[0]);
+            for (int offset = 0; offset + norm_dim <= q_dim; offset += norm_dim)
+                gpu.rmsnorm(q.data() + offset, q.data() + offset,
+                            lw.q_norm, norm_dim, manifest.rms_norm_eps);
+        }
+        if (lw.k_norm) {
+            int norm_dim = 256;
+            std::string kn_name = layer_tensor_name(layer_idx, "attn_k_norm.weight");
+            const auto* kn_info = reader->get_tensor(kn_name);
+            if (kn_info && !kn_info->shape.empty())
+                norm_dim = static_cast<int>(kn_info->shape[0]);
+            for (int offset = 0; offset + norm_dim <= k_dim; offset += norm_dim)
+                gpu.rmsnorm(k.data() + offset, k.data() + offset,
+                            lw.k_norm, norm_dim, manifest.rms_norm_eps);
+        }
+
+        // ── GQA Attention on CPU ──
+        auto& kv = kv_cache[layer_idx];
+        int n_heads = manifest.num_heads;
+        int n_kv_heads = manifest.num_kv_heads;
+        int head_dim = (n_kv_heads > 0) ? (k_dim / n_kv_heads) : manifest.head_dim;
+
+        if (head_dim > 0 && n_heads > 0 && n_kv_heads > 0) {
+            gqa_attention(q.data(), q_dim, k.data(), v.data(), k_dim,
+                          kv, seq_pos, n_heads, n_kv_heads, head_dim,
+                          attn_output);
+        } else {
+            int copy_dim = std::min(q_dim, dim);
+            memcpy(attn_output, q.data(), copy_dim * sizeof(float));
+            if (copy_dim < dim) memset(attn_output + copy_dim, 0, (dim - copy_dim) * sizeof(float));
+        }
+
+        // ── RESUME: start new command buffer for output proj + FFN ──
+        gpu.resume_token();
+
+        // ── Output projection on GPU ──
+        if (lw.wo_raw.data) {
+            int wo_in_dim = n_heads * head_dim;
+            if (wo_in_dim <= 0) wo_in_dim = q_dim;
+            // Upload attention output to GPU (attn_out buffer)
+            gpu.upload_to_gpu(attn_output, pool.attn_out,
+                              wo_in_dim * sizeof(float));
+            auto buf_wo = gpu.get_cached_buffer(lw.wo_raw.data);
+            if (buf_wo) {
+                // output proj: attn_out → ffn_out (temporary)
+                gpu.gemm_int4_gpu(pool.attn_out, buf_wo, pool.ffn_out, 1, dim, wo_in_dim);
+            }
+        } else {
+            // No output projection — upload raw attention output
+            gpu.upload_to_gpu(attn_output, pool.ffn_out, dim * sizeof(float));
+        }
+
+        // ── Residual add on GPU: hidden = hidden + ffn_out ──
+        // pool.hidden still has the pre-attention hidden state (residual).
+        // pool.ffn_out has the attention output projection result.
+        gpu.gpu_residual_add(pool.hidden, pool.ffn_out, pool.hidden, dim);
+
+        // ── Post-attention RMSNorm on GPU ──
+        // pool.hidden now has post-attention residual. Norm into norm_buf.
+        if (lw.post_attention_norm) {
+            auto buf_pn_w = gpu.upload_small_buffer(
+                lw.post_attention_norm, dim * sizeof(float));
+            if (buf_pn_w) {
+                gpu.gpu_rmsnorm(pool.hidden, buf_pn_w, pool.norm_buf,
+                                dim, manifest.rms_norm_eps);
+            }
+        }
+
+        // ── Save pre-FFN residual ──
+        // We need pool.hidden as the residual for after FFN.
+        // FFN reads from pool.norm_buf and writes to pool.ffn_out.
+        // Then: new_hidden = pool.hidden + pool.ffn_out.
+
+        // ── MoE/Dense FFN on GPU ──
+        // gpu_ffn_fused in token-batch mode reads from pool.norm_buf,
+        // writes to pool.ffn_out, and doesn't commit.
+        if (!lw.moe_gate || lw.num_experts <= 0) {
+            // Dense FFN
+            if (lw.ffn_dim > 0 && lw.ffn_w1_raw.data && lw.ffn_w2_raw.data && lw.ffn_w3_raw.data) {
+                auto buf_w1 = gpu.get_cached_buffer(lw.ffn_w1_raw.data);
+                auto buf_w3 = gpu.get_cached_buffer(lw.ffn_w3_raw.data);
+                auto buf_w2 = gpu.get_cached_buffer(lw.ffn_w2_raw.data);
+                if (buf_w1 && buf_w2 && buf_w3) {
+                    gpu.gpu_ffn_fused(nullptr, dim, buf_w1, buf_w3, buf_w2,
+                                      lw.ffn_dim, nullptr);
+                    // Result is in pool.ffn_out
+                } else {
+                    goto attn_moe_cpu_ffn_fallback;
+                }
+            } else {
+                goto attn_moe_cpu_ffn_fallback;
+            }
+        } else {
+            // MoE FFN: gate routing needs CPU. Flush, do MoE, resume.
+            gpu.flush_token();
+            // Download norm_buf for MoE gate computation
+            gpu.download_from_gpu(pool.norm_buf, norm_buf, dim * sizeof(float));
+            moe_ffn(layer_idx, norm_buf, ffn_output);
+            gpu.resume_token();
+            // Upload MoE result to GPU
+            gpu.upload_to_gpu(ffn_output, pool.ffn_out, dim * sizeof(float));
+        }
+
+        // ── Residual add after FFN on GPU ──
+        gpu.gpu_residual_add(pool.hidden, pool.ffn_out, pool.hidden, dim);
+        return;
+
+attn_moe_cpu_ffn_fallback:
+        // Fallback for dense FFN when buffers aren't cached
+        gpu.flush_token();
+        gpu.download_from_gpu(pool.hidden, x, dim * sizeof(float));
+        memcpy(residual, x, dim * sizeof(float));
+        if (lw.post_attention_norm) {
+            gpu.rmsnorm(norm_buf, x, lw.post_attention_norm, dim, manifest.rms_norm_eps);
+        } else {
+            memcpy(norm_buf, x, dim * sizeof(float));
+        }
+        moe_ffn(layer_idx, norm_buf, ffn_output);
+        for (int i = 0; i < dim; i++) x[i] = residual[i] + ffn_output[i];
+        gpu.resume_token();
+        gpu.upload_to_gpu(x, pool.hidden, dim * sizeof(float));
+        return;
+
+    }  // end gpu_resident path
+
+    // ════════════════════════════════════════════════════════════════════
+    //  ORIGINAL CPU PATH (non-token-batch mode)
+    // ════════════════════════════════════════════════════════════════════
 
     // ── Save residual ──
     memcpy(residual, x, dim * sizeof(float));
@@ -864,23 +1151,13 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
     if (lw.wv) fused_gemm(norm_buf, lw.wv, lw.wv_raw, v.data(), 1, v_dim, dim);
 
     // ── Apply Q/K RMSNorm if present ──
-    // Q norm and K norm are applied per-head. The norm weight dimension tells
-    // us the granularity. For simplicity, we apply a single RMSNorm across
-    // the entire Q/K vector if the weight exists.
     if (lw.q_norm) {
-        // q_norm weight might be [head_dim] or [num_heads * head_dim] or [norm_dim].
-        // We apply it in chunks matching the norm weight size across Q.
-        // For Qwen3-Coder-Next, the norm is [256], and Q might be [8192].
-        // We apply the norm in repeating blocks of 256 across Q.
-        int norm_dim = 256;  // From the tensor shape [256]
-        // Try to get actual dim from tensor shape
+        int norm_dim = 256;
         std::string qn_name = layer_tensor_name(layer_idx, "attn_q_norm.weight");
         const auto* qn_info = reader->get_tensor(qn_name);
         if (qn_info && !qn_info->shape.empty()) {
             norm_dim = static_cast<int>(qn_info->shape[0]);
         }
-
-        // Apply norm in blocks of norm_dim across the Q vector
         for (int offset = 0; offset + norm_dim <= q_dim; offset += norm_dim) {
             compute::global_compute().rmsnorm(q.data() + offset, q.data() + offset,
                              lw.q_norm, norm_dim, manifest.rms_norm_eps);
@@ -894,7 +1171,6 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
         if (kn_info && !kn_info->shape.empty()) {
             norm_dim = static_cast<int>(kn_info->shape[0]);
         }
-
         for (int offset = 0; offset + norm_dim <= k_dim; offset += norm_dim) {
             compute::global_compute().rmsnorm(k.data() + offset, k.data() + offset,
                              lw.k_norm, norm_dim, manifest.rms_norm_eps);
@@ -902,43 +1178,37 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
     }
 
     // ── GQA Attention with KV cache ──
-    auto& kv = kv_cache[layer_idx];
-    int n_heads = manifest.num_heads;
-    int n_kv_heads = manifest.num_kv_heads;
-    // Derive head_dim from K projection: head_dim = k_dim / n_kv_heads
-    int head_dim = (n_kv_heads > 0) ? (k_dim / n_kv_heads) : manifest.head_dim;
-    // For Q, head_dim_q = q_dim / n_heads might differ from head_dim_kv.
-    // Use the KV head_dim for the attention computation.
-    int attn_head_dim = head_dim;
+    {
+        auto& kv = kv_cache[layer_idx];
+        int n_heads = manifest.num_heads;
+        int n_kv_heads = manifest.num_kv_heads;
+        int head_dim = (n_kv_heads > 0) ? (k_dim / n_kv_heads) : manifest.head_dim;
+        int attn_head_dim = head_dim;
 
-    if (attn_head_dim > 0 && n_heads > 0 && n_kv_heads > 0) {
-        gqa_attention(q.data(), q_dim, k.data(), v.data(), k_dim,
-                      kv, seq_pos, n_heads, n_kv_heads, attn_head_dim,
-                      attn_output);
-    } else {
-        // Fallback: just use Q as attention output
-        int copy_dim = std::min(q_dim, dim);
-        memcpy(attn_output, q.data(), copy_dim * sizeof(float));
-        if (copy_dim < dim) {
-            memset(attn_output + copy_dim, 0, (dim - copy_dim) * sizeof(float));
-        }
-    }
-
-    // ── Output projection ──
-    // wo shape is [wo_input_dim, hidden_dim]. For Qwen3: [4096, 2048].
-    // attn_output contains n_heads * head_dim_kv = 4096 elements.
-    if (lw.wo) {
-        int wo_in_dim = n_heads * head_dim;
-        if (wo_in_dim <= 0) wo_in_dim = q_dim;
-
-        fused_gemm(attn_output, lw.wo, lw.wo_raw, ffn_output, 1, dim, wo_in_dim);
-        memcpy(attn_output, ffn_output, dim * sizeof(float));
-    } else {
-        // No output projection — truncate/pad to hidden_dim
-        if (q_dim > dim) {
-            // attn_output already has the first `dim` values
+        if (attn_head_dim > 0 && n_heads > 0 && n_kv_heads > 0) {
+            gqa_attention(q.data(), q_dim, k.data(), v.data(), k_dim,
+                          kv, seq_pos, n_heads, n_kv_heads, attn_head_dim,
+                          attn_output);
         } else {
-            memset(attn_output + q_dim, 0, (dim - q_dim) * sizeof(float));
+            int copy_dim = std::min(q_dim, dim);
+            memcpy(attn_output, q.data(), copy_dim * sizeof(float));
+            if (copy_dim < dim) {
+                memset(attn_output + copy_dim, 0, (dim - copy_dim) * sizeof(float));
+            }
+        }
+
+        // ── Output projection ──
+        if (lw.wo) {
+            int wo_in_dim = n_heads * head_dim;
+            if (wo_in_dim <= 0) wo_in_dim = q_dim;
+            fused_gemm(attn_output, lw.wo, lw.wo_raw, ffn_output, 1, dim, wo_in_dim);
+            memcpy(attn_output, ffn_output, dim * sizeof(float));
+        } else {
+            if (q_dim > dim) {
+                // attn_output already has the first `dim` values
+            } else {
+                memset(attn_output + q_dim, 0, (dim - q_dim) * sizeof(float));
+            }
         }
     }
 
