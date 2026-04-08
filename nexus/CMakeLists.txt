@@ -79,6 +79,9 @@ add_library(nexus_core STATIC
     src/compute/metal/metal_backend.mm
     src/compute/metal/metal_context.mm
 
+    # Compute - Dispatch (CPU/GPU router)
+    src/compute/compute_dispatch.cpp
+
     # KV Cache
     src/kv/kv_store.cpp
     src/kv/turbo_quant.cpp

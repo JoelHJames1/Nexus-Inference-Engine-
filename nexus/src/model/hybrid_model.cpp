@@ -8,6 +8,7 @@
 
 #include "model/hybrid_model.h"
 #include "memory/memory_manager.h"
+#include "compute/compute_dispatch.h"
 #include "compute/accelerate/gemm.h"
 #include "quant/gptq.h"
 #include "core/scheduler.h"
@@ -463,15 +464,14 @@ int32_t HybridModel::decode_step(const SamplingParams& params) {
 
     // Apply output norm
     if (m.output_norm) {
-        compute::rms_norm(m.hidden_state, m.hidden_state, m.output_norm,
+        compute::global_compute().rmsnorm(m.hidden_state, m.hidden_state, m.output_norm,
                          m.manifest.hidden_dim, m.manifest.rms_norm_eps);
     }
 
     // Compute logits: hidden_state @ output_weight^T -> logits
     if (m.output_weight) {
-        compute::gemm_f32(m.hidden_state, m.output_weight, m.logits,
-                         1, m.manifest.vocab_size, m.manifest.hidden_dim,
-                         false, true);
+        compute::global_compute().gemm(m.hidden_state, m.output_weight, m.logits,
+                         1, m.manifest.vocab_size, m.manifest.hidden_dim);
     }
 
     int32_t next_token = m.sample_token(m.logits, params);
@@ -530,7 +530,7 @@ void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
 
     // ── Pre-attention RMSNorm ──
     if (lw.attention_norm) {
-        compute::rms_norm(norm_buf, x, lw.attention_norm, dim, manifest.rms_norm_eps);
+        compute::global_compute().rmsnorm(norm_buf, x, lw.attention_norm, dim, manifest.rms_norm_eps);
     } else {
         memcpy(norm_buf, x, dim * sizeof(float));
     }
@@ -543,8 +543,8 @@ void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
                 (void*)norm_buf, (void*)lw.attn_qkv, (void*)qkv_buf, qkv_dim, dim);
         fprintf(stderr, "[gemm] A[0]=%f B[0]=%f\n", norm_buf[0], lw.attn_qkv[0]);
         fflush(stderr);
-        compute::gemm_f32(norm_buf, lw.attn_qkv, qkv_buf,
-                         1, qkv_dim, dim, false, false);
+        compute::global_compute().gemm(norm_buf, lw.attn_qkv, qkv_buf,
+                         1, qkv_dim, dim);
         fprintf(stderr, "[gemm] done, C[0]=%f\n", qkv_buf[0]);
     } else {
         // No QKV weights — zero out and skip attention
@@ -632,8 +632,8 @@ void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
             // ssm_out: [ssm_out_dim, hidden_dim]
             // We project attn_output (ssm_out_dim) -> hidden_dim
             int in_dim = lw.ssm_out_dim;
-            compute::gemm_f32(attn_output, lw.ssm_out, ffn_output,
-                             1, dim, in_dim, false, true);
+            compute::global_compute().gemm(attn_output, lw.ssm_out, ffn_output,
+                             1, dim, in_dim);
             memcpy(attn_output, ffn_output, dim * sizeof(float));
         }
 
@@ -643,8 +643,8 @@ void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
         if (lw.attn_gate && lw.gate_out_dim > 0) {
             // Compute gate: norm_buf @ attn_gate -> gate values
             std::vector<float> gate_vals(lw.gate_out_dim);
-            compute::gemm_f32(norm_buf, lw.attn_gate, gate_vals.data(),
-                             1, lw.gate_out_dim, dim, false, true);
+            compute::global_compute().gemm(norm_buf, lw.attn_gate, gate_vals.data(),
+                             1, lw.gate_out_dim, dim);
             // Apply sigmoid gate element-wise (up to min of gate_dim and dim)
             int gate_dim = std::min(lw.gate_out_dim, dim);
             for (int i = 0; i < gate_dim; i++) {
@@ -665,7 +665,7 @@ ssm_residual:
 
     // ── Post-attention RMSNorm ──
     if (lw.post_attention_norm) {
-        compute::rms_norm(norm_buf, x, lw.post_attention_norm, dim, manifest.rms_norm_eps);
+        compute::global_compute().rmsnorm(norm_buf, x, lw.post_attention_norm, dim, manifest.rms_norm_eps);
     } else {
         memcpy(norm_buf, x, dim * sizeof(float));
     }
@@ -691,7 +691,7 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
 
     // ── Pre-attention RMSNorm ──
     if (lw.attention_norm) {
-        compute::rms_norm(norm_buf, x, lw.attention_norm, dim, manifest.rms_norm_eps);
+        compute::global_compute().rmsnorm(norm_buf, x, lw.attention_norm, dim, manifest.rms_norm_eps);
     } else {
         memcpy(norm_buf, x, dim * sizeof(float));
     }
@@ -705,9 +705,9 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
     std::vector<float> k(k_dim, 0.0f);
     std::vector<float> v(v_dim, 0.0f);
 
-    if (lw.wq) compute::gemm_f32(norm_buf, lw.wq, q.data(), 1, q_dim, dim, false, false);
-    if (lw.wk) compute::gemm_f32(norm_buf, lw.wk, k.data(), 1, k_dim, dim, false, false);
-    if (lw.wv) compute::gemm_f32(norm_buf, lw.wv, v.data(), 1, v_dim, dim, false, false);
+    if (lw.wq) compute::global_compute().gemm(norm_buf, lw.wq, q.data(), 1, q_dim, dim);
+    if (lw.wk) compute::global_compute().gemm(norm_buf, lw.wk, k.data(), 1, k_dim, dim);
+    if (lw.wv) compute::global_compute().gemm(norm_buf, lw.wv, v.data(), 1, v_dim, dim);
 
     // ── Apply Q/K RMSNorm if present ──
     // Q norm and K norm are applied per-head. The norm weight dimension tells
@@ -728,7 +728,7 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
 
         // Apply norm in blocks of norm_dim across the Q vector
         for (int offset = 0; offset + norm_dim <= q_dim; offset += norm_dim) {
-            compute::rms_norm(q.data() + offset, q.data() + offset,
+            compute::global_compute().rmsnorm(q.data() + offset, q.data() + offset,
                              lw.q_norm, norm_dim, manifest.rms_norm_eps);
         }
     }
@@ -742,7 +742,7 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
         }
 
         for (int offset = 0; offset + norm_dim <= k_dim; offset += norm_dim) {
-            compute::rms_norm(k.data() + offset, k.data() + offset,
+            compute::global_compute().rmsnorm(k.data() + offset, k.data() + offset,
                              lw.k_norm, norm_dim, manifest.rms_norm_eps);
         }
     }
@@ -774,8 +774,8 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
     if (lw.wo) {
         // wo: [q_dim, hidden_dim] — project attention output back to hidden_dim
         // attn_output has size q_dim (from the attention heads), project to dim
-        compute::gemm_f32(attn_output, lw.wo, ffn_output,
-                         1, dim, q_dim, false, true);
+        compute::global_compute().gemm(attn_output, lw.wo, ffn_output,
+                         1, dim, q_dim);
         memcpy(attn_output, ffn_output, dim * sizeof(float));
     } else if (q_dim != dim) {
         // No output projection but dimensions mismatch — truncate/pad
@@ -796,7 +796,7 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
 
     // ── Post-attention RMSNorm ──
     if (lw.post_attention_norm) {
-        compute::rms_norm(norm_buf, x, lw.post_attention_norm, dim, manifest.rms_norm_eps);
+        compute::global_compute().rmsnorm(norm_buf, x, lw.post_attention_norm, dim, manifest.rms_norm_eps);
     } else {
         memcpy(norm_buf, x, dim * sizeof(float));
     }
@@ -937,8 +937,8 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
 
     // ── Compute gate logits: x @ moe_gate -> [num_experts] ──
     std::vector<float> gate_logits(num_experts);
-    compute::gemm_f32(x, lw.moe_gate, gate_logits.data(),
-                     1, num_experts, dim, false, true);
+    compute::global_compute().gemm(x, lw.moe_gate, gate_logits.data(),
+                     1, num_experts, dim);
 
     // ── Softmax over gate logits ──
     float max_logit = *std::max_element(gate_logits.begin(), gate_logits.end());
@@ -997,8 +997,8 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
         const float* w3 = lw.expert_w3 + eid * w3_expert_stride;
 
         // SwiGLU: out = (silu(x @ W1) * (x @ W3)) @ W2
-        compute::gemm_f32(x, w1, gate_buf.data(), 1, expert_ffn, dim, false, false);
-        compute::gemm_f32(x, w3, up_buf.data(), 1, expert_ffn, dim, false, false);
+        compute::global_compute().gemm(x, w1, gate_buf.data(), 1, expert_ffn, dim);
+        compute::global_compute().gemm(x, w3, up_buf.data(), 1, expert_ffn, dim);
 
         // SiLU on gate, elementwise multiply with up
         for (int j = 0; j < expert_ffn; j++) {
@@ -1007,8 +1007,8 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
         }
 
         // Down projection
-        compute::gemm_f32(gate_buf.data(), w2, expert_out.data(),
-                         1, dim, expert_ffn, false, true);
+        compute::global_compute().gemm(gate_buf.data(), w2, expert_out.data(),
+                         1, dim, expert_ffn);
 
         // Weighted accumulation into output
         for (int j = 0; j < dim; j++) {

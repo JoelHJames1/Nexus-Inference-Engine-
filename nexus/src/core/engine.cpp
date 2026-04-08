@@ -4,6 +4,7 @@
 #include "memory/memory_manager.h"
 #include "model/transformer.h"
 #include "model/hybrid_model.h"
+#include "compute/compute_dispatch.h"
 #include <cstdio>
 #include <chrono>
 #include <thread>
@@ -28,6 +29,7 @@ struct Engine::Impl {
     std::unique_ptr<MemoryManager> memory;
     std::unique_ptr<model::Transformer> model;
     std::unique_ptr<model::HybridModel> hybrid_model;
+    std::unique_ptr<compute::ComputeDispatch> compute;
     format::ModelManifest manifest;
     bool using_hybrid = false;
 };
@@ -63,6 +65,20 @@ std::unique_ptr<Engine> Engine::create(const std::string& model_path,
     engine->impl_->memory = std::make_unique<MemoryManager>(config.memory);
     fprintf(stderr, "[nexus] Memory limit: %.1f GB\n",
             config.memory.ram_limit / (1024.0 * 1024.0 * 1024.0));
+
+    // Initialize GPU compute
+    engine->impl_->compute = std::make_unique<compute::ComputeDispatch>();
+    compute::set_global_compute(engine->impl_->compute.get());
+    if (config.use_metal) {
+        // Try to find metallib next to the executable or in share/nexus
+        std::string shader_path = "nexus_shaders.metallib";
+        if (engine->impl_->compute->init_gpu(shader_path)) {
+            fprintf(stderr, "[nexus] GPU compute: %s\n",
+                    engine->impl_->compute->gpu_name().c_str());
+        }
+    } else {
+        fprintf(stderr, "[nexus] GPU disabled by user\n");
+    }
 
     // Initialize model — choose HybridModel for hybrid architectures,
     // standard Transformer for everything else.
