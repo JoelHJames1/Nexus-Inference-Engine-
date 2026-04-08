@@ -13,11 +13,13 @@ namespace nexus {
 /// Returns true if the architecture string indicates a hybrid SSM+Attention model
 /// that should use HybridModel instead of the standard Transformer.
 static bool is_hybrid_architecture(const std::string& arch) {
-    return arch == "qwen3_coder_next"
+    return arch == "qwen3next"
+        || arch == "qwen3_coder_next"
         || arch == "qwen3-coder-next"
         || arch == "Qwen3-Coder-Next"
         || arch == "hybrid_ssm_attention"
-        || arch == "hybrid_deltanet_moe";
+        || arch == "hybrid_deltanet_moe"
+        || arch.find("qwen3") != std::string::npos;
 }
 
 struct Engine::Impl {

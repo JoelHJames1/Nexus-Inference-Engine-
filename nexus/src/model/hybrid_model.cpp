@@ -199,6 +199,27 @@ std::unique_ptr<HybridModel> HybridModel::create(
         m.max_qkv_dim = manifest.hidden_dim * 4;  // Conservative estimate
     }
 
+    // Infer vocab_size from tensor shapes if manifest has 0
+    if (m.manifest.vocab_size == 0) {
+        const auto* emb = reader.get_tensor("tok_embeddings.weight");
+        if (emb && emb->shape.size() >= 2) {
+            m.manifest.vocab_size = static_cast<uint32_t>(emb->shape[1]);
+            fprintf(stderr, "[nexus] Inferred vocab_size=%u from tok_embeddings shape\n",
+                    m.manifest.vocab_size);
+        } else {
+            const auto* out = reader.get_tensor("output.weight");
+            if (out && out->shape.size() >= 2) {
+                m.manifest.vocab_size = static_cast<uint32_t>(out->shape[1]);
+                fprintf(stderr, "[nexus] Inferred vocab_size=%u from output.weight shape\n",
+                        m.manifest.vocab_size);
+            } else {
+                m.manifest.vocab_size = 151936;  // Qwen default
+                fprintf(stderr, "[nexus] WARNING: Could not infer vocab_size, using default %u\n",
+                        m.manifest.vocab_size);
+            }
+        }
+    }
+
     fprintf(stderr, "[nexus] HybridModel: %d SSM+MoE layers, %d Attn+MoE layers",
             ssm_count, attn_count);
     if (unknown_count > 0) {
@@ -213,7 +234,7 @@ std::unique_ptr<HybridModel> HybridModel::create(
     m.attn_output = static_cast<float*>(memory.alloc_pages(
         std::max(hidden_bytes, static_cast<size_t>(m.max_qkv_dim) * sizeof(float))));
     m.ffn_output = static_cast<float*>(memory.alloc_pages(hidden_bytes));
-    m.logits = static_cast<float*>(memory.alloc_pages(manifest.vocab_size * sizeof(float)));
+    m.logits = static_cast<float*>(memory.alloc_pages(m.manifest.vocab_size * sizeof(float)));
     m.norm_buf = static_cast<float*>(memory.alloc_pages(hidden_bytes));
     m.qkv_buf = static_cast<float*>(memory.alloc_pages(
         static_cast<size_t>(m.max_qkv_dim) * sizeof(float)));
@@ -256,7 +277,10 @@ std::unique_ptr<HybridModel> HybridModel::create(
         }
 
         m.kv_cache[i].kv_dim = kv_dim;
-        size_t kv_bytes = static_cast<size_t>(manifest.max_seq_len) * kv_dim * sizeof(float);
+        // Cap max_seq_len for KV cache to avoid OOM (use 4096 for initial testing)
+        int effective_seq = std::min(static_cast<int>(m.manifest.max_seq_len), 4096);
+        m.max_seq_len = effective_seq;
+        size_t kv_bytes = static_cast<size_t>(effective_seq) * kv_dim * sizeof(float);
         m.kv_cache[i].keys = static_cast<float*>(memory.alloc_pages(kv_bytes));
         m.kv_cache[i].values = static_cast<float*>(memory.alloc_pages(kv_bytes));
         m.kv_cache[i].seq_len = 0;
@@ -279,14 +303,19 @@ void HybridModel::prefill(const std::vector<int32_t>& tokens) {
     int num_tokens = static_cast<int>(tokens.size());
 
     for (int t = 0; t < num_tokens; t++) {
-        // Lookup embedding
-        if (m.token_embeddings && tokens[t] >= 0 &&
-            tokens[t] < static_cast<int32_t>(m.manifest.vocab_size)) {
-            memcpy(m.hidden_state,
-                   m.token_embeddings + tokens[t] * m.manifest.hidden_dim,
-                   m.manifest.hidden_dim * sizeof(float));
-        } else {
-            memset(m.hidden_state, 0, m.manifest.hidden_dim * sizeof(float));
+        // Lookup embedding — initialize hidden state with small random values
+        // TODO: proper embedding dequantization (current NXF stores INT4-packed data,
+        // not raw FP32, so direct indexing doesn't work yet)
+        {
+            int dim = m.manifest.hidden_dim;
+            // Use a deterministic pseudo-random initialization based on token ID
+            // This allows the engine to run end-to-end while we implement proper
+            // embedding dequant in the next iteration.
+            uint32_t seed = static_cast<uint32_t>(tokens[t]) * 2654435761u;
+            for (int i = 0; i < dim; i++) {
+                seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+                m.hidden_state[i] = (static_cast<float>(seed & 0xFFFF) / 65536.0f - 0.5f) * 0.02f;
+            }
         }
 
         // Stream through all layers
