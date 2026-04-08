@@ -389,6 +389,11 @@ bool ComputeDispatch::gpu_residual_add(MetalBackend::buffer_id buf_a,
     return gpu_->residual_add(buf_a, buf_b, buf_out, n);
 }
 
+MetalBackend::buffer_id ComputeDispatch::get_cached_buffer(const void* ptr) const {
+    auto it = wrapped_buffer_cache_.find(ptr);
+    return (it != wrapped_buffer_cache_.end()) ? it->second : 0;
+}
+
 // ─── Element-wise ops ───────────────────────────────────────────────────────
 
 void ComputeDispatch::rmsnorm(float* out, const float* x, const float* weight,

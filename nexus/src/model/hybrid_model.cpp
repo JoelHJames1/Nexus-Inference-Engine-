@@ -530,6 +530,37 @@ std::unique_ptr<HybridModel> HybridModel::create(
 
         gpu2.init_gpu_pool(manifest.hidden_dim, max_q_dim, max_kv_dim,
                            max_ffn_dim, m.manifest.vocab_size);
+
+        // Pre-cache ALL raw weight pointers as MTLBuffers for GPU-resident path.
+        // This populates the wrapped_buffer_cache_ so get_cached_buffer() finds them.
+        if (m.resident_mode && gpu2.has_gpu_pool()) {
+            int cached = 0;
+            auto cache_raw = [&](const HybridLayerWeights::RawWeight& raw) {
+                if (raw.data && raw.bytes > 0) {
+                    // gemm_int4 will cache on first call, but we can pre-cache here
+                    // by doing a dummy call that just wraps the pointer
+                    float dummy_in[1] = {0}, dummy_out[1] = {0};
+                    gpu2.gemm_int4(dummy_in, raw.data, raw.bytes, dummy_out, 1, 1, 1);
+                    cached++;
+                }
+            };
+            for (auto& lw : m.layer_weights) {
+                cache_raw(lw.attn_qkv_raw);
+                cache_raw(lw.attn_gate_raw);
+                cache_raw(lw.ssm_out_raw);
+                cache_raw(lw.wq_raw);
+                cache_raw(lw.wk_raw);
+                cache_raw(lw.wv_raw);
+                cache_raw(lw.wo_raw);
+                cache_raw(lw.moe_gate_raw);
+                cache_raw(lw.ffn_w1_raw);
+                cache_raw(lw.ffn_w2_raw);
+                cache_raw(lw.ffn_w3_raw);
+            }
+            cache_raw(m.output_weight_raw);
+            fprintf(stderr, "[nexus] Pre-cached %d weight MTLBuffers for GPU-resident path\n", cached);
+            gpu2.preload_all_buffers();
+        }
     }
 
     fprintf(stderr, "[nexus] HybridModel initialized: %u layers, %s mode\n",
@@ -1043,24 +1074,53 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
     memset(out, 0, dim * sizeof(float));
 
     if (!lw.moe_gate || lw.num_experts <= 0) {
-        // No MoE — check for dense FFN (SwiGLU: out = silu(x @ w1) * (x @ w3) @ w2)
+        // Dense FFN (SwiGLU: out = silu(x @ w1) * (x @ w3) @ w2)
         if (lw.ffn_dim > 0 && (lw.ffn_w1_raw.data || lw.ffn_w1)) {
             int ffn = lw.ffn_dim;
+            auto& gpu = compute::global_compute();
+
+            // GPU-RESIDENT PATH: all 3 GEMMs + SiLU stay on GPU
+            if (gpu.has_gpu_pool() && lw.ffn_w1_raw.data && lw.ffn_w2_raw.data && lw.ffn_w3_raw.data) {
+                auto& pool = gpu.gpu_pool();
+
+                // Get cached weight buffer IDs
+                auto buf_w1 = gpu.get_cached_buffer(lw.ffn_w1_raw.data);
+                auto buf_w3 = gpu.get_cached_buffer(lw.ffn_w3_raw.data);
+                auto buf_w2 = gpu.get_cached_buffer(lw.ffn_w2_raw.data);
+
+                if (buf_w1 && buf_w2 && buf_w3) {
+                    // Upload activation to GPU once
+                    gpu.upload_to_gpu(x, pool.hidden, dim * sizeof(float));
+
+                    // gate = x @ w1 (GPU-resident, zero CPU copy)
+                    gpu.gemm_int4_gpu(pool.hidden, buf_w1, pool.ffn_gate, 1, ffn, dim);
+                    // up = x @ w3 (GPU-resident)
+                    gpu.gemm_int4_gpu(pool.hidden, buf_w3, pool.ffn_up, 1, ffn, dim);
+                    // SiLU(gate) * up on GPU
+                    gpu.gpu_swiglu(pool.ffn_gate, pool.ffn_up, ffn);
+                    // out = gate_buf @ w2 (GPU-resident)
+                    gpu.gemm_int4_gpu(pool.ffn_gate, buf_w2, pool.ffn_out, 1, dim, ffn);
+
+                    // Flush GPU batch before reading result
+                    gpu.end_gpu_batch();
+                    // Download result
+                    gpu.download_from_gpu(pool.ffn_out, out, dim * sizeof(float));
+                    // Restart batch for remaining layer ops
+                    gpu.begin_gpu_batch();
+                    return;
+                }
+            }
+
+            // CPU fallback: original path
             std::vector<float> gate_buf(ffn);
             std::vector<float> up_buf(ffn);
-
-            // Apply pre-FFN norm if present
             const float* ffn_input = x;
-            // gate = x @ w1
             fused_gemm(ffn_input, lw.ffn_w1, lw.ffn_w1_raw, gate_buf.data(), 1, ffn, dim);
-            // up = x @ w3
             fused_gemm(ffn_input, lw.ffn_w3, lw.ffn_w3_raw, up_buf.data(), 1, ffn, dim);
-            // SiLU(gate) * up
             for (int i = 0; i < ffn; i++) {
                 float s = gate_buf[i] / (1.0f + expf(-gate_buf[i]));
                 gate_buf[i] = s * up_buf[i];
             }
-            // out = gate_buf @ w2
             fused_gemm(gate_buf.data(), lw.ffn_w2, lw.ffn_w2_raw, out, 1, dim, ffn);
             return;
         }

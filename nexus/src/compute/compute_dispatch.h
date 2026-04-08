@@ -167,6 +167,9 @@ public:
     /// unmapped or at shutdown.
     void clear_buffer_cache();
 
+    /// Get a cached wrapped buffer ID for a raw pointer. Returns 0 if not cached.
+    MetalBackend::buffer_id get_cached_buffer(const void* ptr) const;
+
     /// Pre-allocate the activation buffer to the maximum size needed.
     /// In resident mode this avoids reallocation on the per-token path.
     void pre_allocate_activation_buffer(size_t max_act_bytes, size_t max_out_bytes);
