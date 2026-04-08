@@ -9,6 +9,7 @@
 #include "model/hybrid_model.h"
 #include "memory/memory_manager.h"
 #include "compute/accelerate/gemm.h"
+#include "quant/gptq.h"
 #include "core/scheduler.h"
 #include <cstdio>
 #include <cmath>
@@ -53,6 +54,10 @@ struct HybridModel::Impl {
     float* qkv_buf = nullptr;            // [max_qkv_dim] for fused QKV output
     float* moe_scratch = nullptr;        // [hidden_dim] for MoE accumulation
     float* gate_logits_buf = nullptr;    // [max_num_experts] for router
+
+    // Dequantized weight buffers — we allocate FP32 buffers and dequant into them.
+    // Tracked for cleanup on eviction.
+    std::vector<float*> dequant_buffers;
 
     // Sequence state
     int current_seq_len = 0;
@@ -111,10 +116,115 @@ float* HybridModel::Impl::load_tensor(const char* name,
         *shape_out = info->shape;
     }
 
-    const void* mapped = reader->map_chunk(info->chunks[0]);
+    const auto& chunk = info->chunks[0];
+    const void* mapped = reader->map_chunk(chunk);
     if (!mapped) return nullptr;
 
-    return const_cast<float*>(static_cast<const float*>(mapped));
+    // Compute total number of elements from shape
+    int64_t num_elements = 1;
+    for (auto s : info->shape) num_elements *= s;
+    if (num_elements <= 0) return nullptr;
+
+    Codec codec = chunk.codec;
+
+    // If data is already FP32, return directly
+    if (codec == Codec::FP32) {
+        return const_cast<float*>(static_cast<const float*>(mapped));
+    }
+
+    // For small tensors (norms, biases < 64KB), the NXF writer stores them
+    // as FP32 regardless of the target codec. Check if the chunk size matches
+    // FP32 expectations.
+    if (chunk.decompressed_size == static_cast<uint32_t>(num_elements * 4)) {
+        // Data is actually FP32 (small tensor passthrough)
+        return const_cast<float*>(static_cast<const float*>(mapped));
+    }
+
+    // Dequantize: allocate FP32 buffer and convert from quantized format
+    size_t fp32_bytes = num_elements * sizeof(float);
+    // Round up to page alignment
+    size_t alloc_size = (fp32_bytes + kPageSize - 1) & ~(kPageSize - 1);
+    float* fp32_buf = static_cast<float*>(memory->alloc_pages(alloc_size));
+    if (!fp32_buf) {
+        fprintf(stderr, "[nexus] WARNING: Failed to allocate dequant buffer for %s (%lld elements)\n",
+                name, (long long)num_elements);
+        return nullptr;
+    }
+    dequant_buffers.push_back(fp32_buf);
+
+    const uint8_t* src = static_cast<const uint8_t*>(mapped);
+
+    switch (codec) {
+        case Codec::FP16: {
+            // FP16 → FP32
+            const uint16_t* fp16 = reinterpret_cast<const uint16_t*>(src);
+            for (int64_t i = 0; i < num_elements; i++) {
+                uint32_t h = fp16[i];
+                uint32_t sign = (h & 0x8000) << 16;
+                uint32_t exp = (h >> 10) & 0x1F;
+                uint32_t mant = h & 0x3FF;
+                uint32_t f;
+                if (exp == 0) {
+                    f = sign;  // zero/denorm → zero
+                } else if (exp == 31) {
+                    f = sign | 0x7F800000 | (mant << 13);  // inf/nan
+                } else {
+                    f = sign | ((exp + 112) << 23) | (mant << 13);
+                }
+                memcpy(&fp32_buf[i], &f, 4);
+            }
+            break;
+        }
+        case Codec::INT4:
+        case Codec::GPTQ:
+        case Codec::AWQ: {
+            // INT4 block-quantized: data contains packed nibbles + scales + zeros
+            // Layout: [packed_data][scales][zeros]
+            // For now, use a simple dequant: each group of 128 elements has
+            // 64 bytes of packed data + 4 bytes scale + 4 bytes zero
+            int group_size = 128;
+            int num_groups = (num_elements + group_size - 1) / group_size;
+            size_t packed_size = (num_elements + 1) / 2;  // 2 values per byte
+
+            // Check if the chunk contains scale/zero data after packed data
+            if (chunk.compressed_size > packed_size + num_groups * 8) {
+                // Has scale + zero per group
+                const float* scales = reinterpret_cast<const float*>(src + packed_size);
+                const float* zeros = scales + num_groups;
+                quant::dequant_int4(fp32_buf, src, scales, zeros,
+                                    static_cast<int>(num_elements), group_size);
+            } else {
+                // No separate scale/zero — use simple uniform dequant
+                // Map nibble [0,15] to [-1, 1] range
+                for (int64_t i = 0; i < num_elements; i += 2) {
+                    uint8_t packed = src[i / 2];
+                    int lo = packed & 0x0F;
+                    int hi = (packed >> 4) & 0x0F;
+                    fp32_buf[i] = (static_cast<float>(lo) - 8.0f) / 8.0f;
+                    if (i + 1 < num_elements) {
+                        fp32_buf[i + 1] = (static_cast<float>(hi) - 8.0f) / 8.0f;
+                    }
+                }
+            }
+            break;
+        }
+        case Codec::INT8: {
+            const int8_t* i8 = reinterpret_cast<const int8_t*>(src);
+            // Simple symmetric dequant
+            for (int64_t i = 0; i < num_elements; i++) {
+                fp32_buf[i] = static_cast<float>(i8[i]) / 127.0f;
+            }
+            break;
+        }
+        default:
+            // Unknown codec — zero fill
+            memset(fp32_buf, 0, fp32_bytes);
+            fprintf(stderr, "[nexus] WARNING: unknown codec %d for %s, zero-filling\n",
+                    (int)codec, name);
+            break;
+    }
+
+    return fp32_buf;
 }
 
 // ─── Layer type detection ───────────────────────────────────────────────────
@@ -287,9 +397,14 @@ std::unique_ptr<HybridModel> HybridModel::create(
     }
 
     // Load embedding weights (these stay resident)
+    fprintf(stderr, "[nexus] Loading embeddings (vocab=%u, dim=%u, ~%.0f MB FP32)...\n",
+            m.manifest.vocab_size, manifest.hidden_dim,
+            (double)m.manifest.vocab_size * manifest.hidden_dim * 4 / (1024*1024));
     if (!m.load_embedding_weights()) {
         fprintf(stderr, "[nexus] WARNING: Could not load embeddings, using zero initialization\n");
     }
+    fprintf(stderr, "[nexus] Embeddings: tok=%p norm=%p out=%p\n",
+            (void*)m.token_embeddings, (void*)m.output_norm, (void*)m.output_weight);
 
     fprintf(stderr, "[nexus] HybridModel initialized: %u layers, streaming mode\n",
             manifest.num_layers);
@@ -303,19 +418,18 @@ void HybridModel::prefill(const std::vector<int32_t>& tokens) {
     int num_tokens = static_cast<int>(tokens.size());
 
     for (int t = 0; t < num_tokens; t++) {
-        // Lookup embedding — initialize hidden state with small random values
-        // TODO: proper embedding dequantization (current NXF stores INT4-packed data,
-        // not raw FP32, so direct indexing doesn't work yet)
-        {
+        fprintf(stderr, "[nexus] Prefill token %d/%d (id=%d)\n", t+1, num_tokens, tokens[t]);
+        // Lookup embedding
+        if (m.token_embeddings && tokens[t] >= 0 &&
+            tokens[t] < static_cast<int32_t>(m.manifest.vocab_size)) {
+            int tid = tokens[t];
             int dim = m.manifest.hidden_dim;
-            // Use a deterministic pseudo-random initialization based on token ID
-            // This allows the engine to run end-to-end while we implement proper
-            // embedding dequant in the next iteration.
-            uint32_t seed = static_cast<uint32_t>(tokens[t]) * 2654435761u;
+            int vocab = m.manifest.vocab_size;
             for (int i = 0; i < dim; i++) {
-                seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
-                m.hidden_state[i] = (static_cast<float>(seed & 0xFFFF) / 65536.0f - 0.5f) * 0.02f;
+                m.hidden_state[i] = m.token_embeddings[i * vocab + tid];
             }
+        } else {
+            memset(m.hidden_state, 0, m.manifest.hidden_dim * sizeof(float));
         }
 
         // Stream through all layers
@@ -380,6 +494,14 @@ int HybridModel::seq_len() const {
 
 void HybridModel::Impl::execute_layer(uint32_t layer_idx, float* x, int seq_pos) {
     auto& lw = layer_weights[layer_idx];
+    if (layer_idx == 0) {
+        fprintf(stderr, "[nexus] Layer 0: type=%d loaded=%d norm=%p qkv=%p gate=%p qkv_dim=%d max_qkv=%d\n",
+                (int)lw.type, lw.loaded, (void*)lw.attention_norm,
+                (void*)lw.attn_qkv, (void*)lw.moe_gate,
+                lw.qkv_out_dim, max_qkv_dim);
+        fprintf(stderr, "[nexus] Buffers: hidden=%p residual=%p norm_buf=%p qkv_buf=%p attn_out=%p\n",
+                (void*)hidden_state, (void*)residual, (void*)norm_buf, (void*)qkv_buf, (void*)attn_output);
+    }
 
     switch (lw.type) {
         case HybridLayerType::SSM_MoE:
@@ -417,8 +539,13 @@ void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
     // attn_qkv: [hidden_dim, qkv_out_dim] — single matmul
     int qkv_dim = lw.qkv_out_dim;
     if (lw.attn_qkv && qkv_dim > 0) {
+        fprintf(stderr, "[gemm] A=%p B=%p C=%p M=1 N=%d K=%d\n",
+                (void*)norm_buf, (void*)lw.attn_qkv, (void*)qkv_buf, qkv_dim, dim);
+        fprintf(stderr, "[gemm] A[0]=%f B[0]=%f\n", norm_buf[0], lw.attn_qkv[0]);
+        fflush(stderr);
         compute::gemm_f32(norm_buf, lw.attn_qkv, qkv_buf,
-                         1, qkv_dim, dim, false, true);
+                         1, qkv_dim, dim, false, false);
+        fprintf(stderr, "[gemm] done, C[0]=%f\n", qkv_buf[0]);
     } else {
         // No QKV weights — zero out and skip attention
         memset(qkv_buf, 0, dim * sizeof(float));
@@ -578,9 +705,9 @@ void HybridModel::Impl::execute_attention_moe_layer(uint32_t layer_idx, float* x
     std::vector<float> k(k_dim, 0.0f);
     std::vector<float> v(v_dim, 0.0f);
 
-    if (lw.wq) compute::gemm_f32(norm_buf, lw.wq, q.data(), 1, q_dim, dim, false, true);
-    if (lw.wk) compute::gemm_f32(norm_buf, lw.wk, k.data(), 1, k_dim, dim, false, true);
-    if (lw.wv) compute::gemm_f32(norm_buf, lw.wv, v.data(), 1, v_dim, dim, false, true);
+    if (lw.wq) compute::gemm_f32(norm_buf, lw.wq, q.data(), 1, q_dim, dim, false, false);
+    if (lw.wk) compute::gemm_f32(norm_buf, lw.wk, k.data(), 1, k_dim, dim, false, false);
+    if (lw.wv) compute::gemm_f32(norm_buf, lw.wv, v.data(), 1, v_dim, dim, false, false);
 
     // ── Apply Q/K RMSNorm if present ──
     // Q norm and K norm are applied per-head. The norm weight dimension tells
@@ -870,8 +997,8 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
         const float* w3 = lw.expert_w3 + eid * w3_expert_stride;
 
         // SwiGLU: out = (silu(x @ W1) * (x @ W3)) @ W2
-        compute::gemm_f32(x, w1, gate_buf.data(), 1, expert_ffn, dim, false, true);
-        compute::gemm_f32(x, w3, up_buf.data(), 1, expert_ffn, dim, false, true);
+        compute::gemm_f32(x, w1, gate_buf.data(), 1, expert_ffn, dim, false, false);
+        compute::gemm_f32(x, w3, up_buf.data(), 1, expert_ffn, dim, false, false);
 
         // SiLU on gate, elementwise multiply with up
         for (int j = 0; j < expert_ffn; j++) {
@@ -907,40 +1034,35 @@ bool HybridModel::Impl::load_layer_weights(uint32_t layer_idx) {
     load("attention_norm.weight", lw.attention_norm);
     load("post_attention_norm.weight", lw.post_attention_norm);
 
-    // ── MoE weights (shared by both types) ──
+    // ── MoE weights ──
+    // NOTE: Expert weights (w1/w2/w3) are HUGE (512 experts × 2048 × 512 each).
+    // Loading all of them would require ~1.6 GB FP32 per layer. Instead, we load
+    // only the gate weights here and defer expert loading to the MoE forward pass
+    // where we know which experts are active.
     {
         std::vector<int64_t> gate_shape;
         load("feed_forward.gate.weight", lw.moe_gate, &gate_shape);
         if (lw.moe_gate && gate_shape.size() >= 2) {
-            // gate: [hidden_dim, num_experts] or [num_experts, hidden_dim]
-            // Convention: the larger dimension is num_experts for 512-expert models
             int d0 = static_cast<int>(gate_shape[0]);
             int d1 = static_cast<int>(gate_shape[1]);
-            if (d1 > d0) {
-                lw.num_experts = d1;
-            } else {
-                lw.num_experts = d0;
-            }
+            lw.num_experts = (d1 > d0) ? d1 : d0;
         }
-    }
-
-    {
-        std::vector<int64_t> w1_shape;
-        load("feed_forward.experts.w1.weight", lw.expert_w1, &w1_shape);
-        if (lw.expert_w1 && w1_shape.size() >= 3) {
-            // w1: [num_experts, hidden_dim, expert_ffn_dim]
-            if (lw.num_experts == 0) {
-                lw.num_experts = static_cast<int>(w1_shape[0]);
-            }
-            lw.expert_ffn_dim = static_cast<int>(w1_shape[2]);
-        } else if (lw.expert_w1 && w1_shape.size() == 2) {
-            // Fallback: maybe [hidden_dim, expert_ffn_dim] for single expert
-            lw.expert_ffn_dim = static_cast<int>(w1_shape[1]);
+        // Get expert FFN dim from tensor shape metadata without loading data
+        std::string w1_name = layer_tensor_name(layer_idx, "feed_forward.experts.w1.weight");
+        const auto* w1_info = reader->get_tensor(w1_name);
+        if (w1_info && w1_info->shape.size() >= 3) {
+            if (lw.num_experts == 0) lw.num_experts = static_cast<int>(w1_info->shape[0]);
+            lw.expert_ffn_dim = static_cast<int>(w1_info->shape[2]);
+        } else if (w1_info && w1_info->shape.size() >= 2) {
+            lw.expert_ffn_dim = static_cast<int>(w1_info->shape[1]);
         }
+        if (lw.expert_ffn_dim == 0) lw.expert_ffn_dim = 512;  // Qwen3-Coder-Next default
+        if (lw.num_experts == 0) lw.num_experts = 512;
     }
-
-    load("feed_forward.experts.w2.weight", lw.expert_w2);
-    load("feed_forward.experts.w3.weight", lw.expert_w3);
+    // Expert w1/w2/w3 are NOT loaded here — loaded on-demand in moe_ffn()
+    lw.expert_w1 = nullptr;
+    lw.expert_w2 = nullptr;
+    lw.expert_w3 = nullptr;
     load("ffn_gate_inp_shexp.weight", lw.shared_expert_gate);
 
     // ── Type-specific weights ──
