@@ -73,7 +73,6 @@ MetalBackend::buffer_id ComputeDispatch::ensure_buffer(BufferCache& cache, size_
 
 void ComputeDispatch::gemm(const float* A, const float* B, float* C,
                             int M, int N, int K) {
-    // Route large matrix ops to GPU. For small element-wise ops, CPU is faster.
     if (gpu_ready_ && static_cast<int64_t>(N) * K > 100000) {
         // GPU path: upload to shared buffers, dispatch Metal tiled GEMM
         size_t a_size = M * K * sizeof(float);
@@ -85,14 +84,36 @@ void ComputeDispatch::gemm(const float* A, const float* B, float* C,
         auto bc = ensure_buffer(buf_c_, c_size);
 
         if (ba && bb && bc) {
-            gpu_->copy_to_buffer(ba, A, a_size);
-            gpu_->copy_to_buffer(bb, B, b_size);
+            // Validate source pointers before GPU copy
+            if (!A || !B || !C) {
+                fprintf(stderr, "[compute] NULL pointer: A=%p B=%p C=%p\n", (void*)A, (void*)B, (void*)C);
+                goto cpu_fallback;
+            }
+            // Verify B data is accessible (catch bad dequant pointers)
+            {
+                volatile float test_b = B[0];
+                volatile float test_b_end = B[(size_t)K * N - 1];
+                (void)test_b; (void)test_b_end;
+            }
+            if (!gpu_->copy_to_buffer(ba, A, a_size)) {
+                fprintf(stderr, "[compute] copy_to_buffer(A) failed\n");
+                goto cpu_fallback;
+            }
+            if (!gpu_->copy_to_buffer(bb, B, b_size)) {
+                fprintf(stderr, "[compute] copy_to_buffer(B) failed\n");
+                goto cpu_fallback;
+            }
 
-            if (gpu_->gemm_f32(ba, bb, bc, M, N, K)) {
-                // Read result back (also zero-copy on UMA)
+            fprintf(stderr, "[gpu] gemm dispatch M=%d N=%d K=%d...", M, N, K);
+            fflush(stderr);
+            bool ok = gpu_->gemm_f32(ba, bb, bc, M, N, K);
+            fprintf(stderr, "%s\n", ok ? "OK" : "FAIL");
+            if (ok) {
                 void* result = gpu_->buffer_contents(bc);
+                fprintf(stderr, "[gpu] readback ptr=%p\n", result);
                 if (result) {
                     memcpy(C, result, c_size);
+                    fprintf(stderr, "[gpu] done\n");
                     return;
                 }
                 fprintf(stderr, "[compute] GPU GEMM: buffer_contents returned null\n");
@@ -106,6 +127,7 @@ void ComputeDispatch::gemm(const float* A, const float* B, float* C,
         // Fall through to CPU on failure
     }
 
+cpu_fallback:
     // CPU path: Accelerate cblas_sgemm (auto-uses AMX coprocessor)
     compute::gemm_f32(A, B, C, M, N, K, false, false);
 }

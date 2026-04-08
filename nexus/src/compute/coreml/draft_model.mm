@@ -81,7 +81,7 @@ DraftModel::DraftModel(const DraftModelConfig& config)
             NSURL* modelURL = [NSURL fileURLWithPath:
                 [NSString stringWithUTF8String:config.coreml_model_path.c_str()]];
 
-            impl_->coreml_model = [MLModel modelOfContentsOfURL:modelURL
+            impl_->coreml_model = [MLModel modelWithContentsOfURL:modelURL
                                                    configuration:mlconfig
                                                            error:&error];
 

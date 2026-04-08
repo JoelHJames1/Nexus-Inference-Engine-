@@ -179,33 +179,21 @@ float* HybridModel::Impl::load_tensor(const char* name,
         case Codec::INT4:
         case Codec::GPTQ:
         case Codec::AWQ: {
-            // INT4 block-quantized: data contains packed nibbles + scales + zeros
-            // Layout: [packed_data][scales][zeros]
-            // For now, use a simple dequant: each group of 128 elements has
-            // 64 bytes of packed data + 4 bytes scale + 4 bytes zero
-            int group_size = 128;
-            int num_groups = (num_elements + group_size - 1) / group_size;
-            size_t packed_size = (num_elements + 1) / 2;  // 2 values per byte
+            // INT4 dequant: map nibbles to floats within the bounds of the mapped chunk.
+            size_t avail_bytes = chunk.compressed_size;
+            int64_t max_pairs = static_cast<int64_t>(avail_bytes);  // Each byte = 2 elements
+            int64_t safe_elements = std::min(num_elements, max_pairs * 2);
 
-            // Check if the chunk contains scale/zero data after packed data
-            if (chunk.compressed_size > packed_size + num_groups * 8) {
-                // Has scale + zero per group
-                const float* scales = reinterpret_cast<const float*>(src + packed_size);
-                const float* zeros = scales + num_groups;
-                quant::dequant_int4(fp32_buf, src, scales, zeros,
-                                    static_cast<int>(num_elements), group_size);
-            } else {
-                // No separate scale/zero — use simple uniform dequant
-                // Map nibble [0,15] to [-1, 1] range
-                for (int64_t i = 0; i < num_elements; i += 2) {
-                    uint8_t packed = src[i / 2];
-                    int lo = packed & 0x0F;
-                    int hi = (packed >> 4) & 0x0F;
-                    fp32_buf[i] = (static_cast<float>(lo) - 8.0f) / 8.0f;
-                    if (i + 1 < num_elements) {
-                        fp32_buf[i + 1] = (static_cast<float>(hi) - 8.0f) / 8.0f;
-                    }
+            for (int64_t i = 0; i < safe_elements; i += 2) {
+                uint8_t packed = src[i / 2];
+                fp32_buf[i] = (static_cast<float>(packed & 0x0F) - 8.0f) / 8.0f;
+                if (i + 1 < safe_elements) {
+                    fp32_buf[i + 1] = (static_cast<float>((packed >> 4) & 0x0F) - 8.0f) / 8.0f;
                 }
+            }
+            // Zero-fill any remaining elements beyond available data
+            for (int64_t i = safe_elements; i < num_elements; i++) {
+                fp32_buf[i] = 0.0f;
             }
             break;
         }

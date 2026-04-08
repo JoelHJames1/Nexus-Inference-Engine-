@@ -146,6 +146,14 @@ endif()
 # NEON intrinsics are always available on arm64
 target_compile_options(nexus_core PRIVATE -march=armv8.2-a+fp16)
 
+# Enable ARC for Objective-C++ files (required for Metal buffer bridging)
+set_source_files_properties(
+    src/compute/metal/metal_backend.mm
+    src/compute/metal/metal_context.mm
+    src/compute/coreml/draft_model.mm
+    PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+)
+
 # ─── Metal shader compilation ────────────────────────────────────────────────
 set(METAL_SHADERS
     shaders/gemm_dequant.metal
