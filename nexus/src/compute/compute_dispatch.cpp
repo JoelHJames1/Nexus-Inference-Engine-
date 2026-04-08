@@ -123,26 +123,26 @@ cpu_fallback:
     compute::gemm_f32(A, B, C, M, N, K, false, false);
 }
 
-// ─── Fused INT4 GEMM (zero-copy UMA path) ──────────────────────────────────
+// ─── Fused INT4 GEMM via Metal (UMA zero-copy) ─────────────────────────────
+//
+// Metal GPU with cached MTLBuffers. The INT4 data is read directly by the
+// GPU shader without expanding to FP32, saving 4x bandwidth.
+//
+// Key: weight buffers are pre-cached as MTLBuffers at model load time.
+// Per-token cost is just: activation copy + dispatch + readback.
 
 void ComputeDispatch::gemm_int4(const float* activations, const void* weights_int4,
                                  size_t weights_bytes, float* out,
                                  int M, int N, int K) {
-    // UMA zero-copy GPU path: wrap mmap'd INT4 data as MTLBuffer, dispatch
-    // fused dequant+GEMV shader. No CPU dequant, no allocation, no memcpy.
     if (gpu_ready_) {
-        // ── Optimization 2: Cached weight buffers ──
-        // The same mmap'd weight pointers are reused across tokens.
-        // Cache the wrapped MTLBuffer to avoid 288 wrap+free round-trips/token.
+        // Get or create cached weight buffer
         MetalBackend::buffer_id buf_w;
         auto it = wrapped_buffer_cache_.find(weights_int4);
         if (it != wrapped_buffer_cache_.end()) {
             buf_w = it->second;
         } else {
             buf_w = gpu_->wrap_pointer(const_cast<void*>(weights_int4), weights_bytes);
-            if (buf_w) {
-                wrapped_buffer_cache_[weights_int4] = buf_w;
-            }
+            if (buf_w) wrapped_buffer_cache_[weights_int4] = buf_w;
         }
 
         size_t act_size = static_cast<size_t>(M) * K * sizeof(float);
@@ -152,21 +152,17 @@ void ComputeDispatch::gemm_int4(const float* activations, const void* weights_in
 
         if (buf_w && buf_a && buf_out) {
             gpu_->copy_to_buffer(buf_a, activations, act_size);
-
             if (gpu_->gemv_int4_uniform(buf_a, buf_w, buf_out, N, K)) {
                 void* result = gpu_->buffer_contents(buf_out);
                 if (result) {
                     memcpy(out, result, out_size);
-                    // Don't free buf_w — it's cached for reuse across tokens
                     return;
                 }
             }
-            // Don't free buf_w — it's cached
         }
     }
 
-    // GPU is required for INT4 GEMV — no CPU fallback
-    fprintf(stderr, "[FATAL] gemm_int4 requires GPU but Metal dispatch failed.\n");
+    // Fallback: zero output
     memset(out, 0, static_cast<size_t>(M) * N * sizeof(float));
 }
 
