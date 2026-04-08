@@ -419,7 +419,7 @@ void HybridModel::prefill(const std::vector<int32_t>& tokens) {
     int num_tokens = static_cast<int>(tokens.size());
 
     for (int t = 0; t < num_tokens; t++) {
-        fprintf(stderr, "[nexus] Prefill token %d/%d (id=%d)\n", t+1, num_tokens, tokens[t]);
+        
         // Lookup embedding
         if (m.token_embeddings && tokens[t] >= 0 &&
             tokens[t] < static_cast<int32_t>(m.manifest.vocab_size)) {
@@ -494,15 +494,6 @@ int HybridModel::seq_len() const {
 
 void HybridModel::Impl::execute_layer(uint32_t layer_idx, float* x, int seq_pos) {
     auto& lw = layer_weights[layer_idx];
-    if (layer_idx == 0) {
-        fprintf(stderr, "[nexus] Layer 0: type=%d loaded=%d norm=%p qkv=%p gate=%p qkv_dim=%d max_qkv=%d\n",
-                (int)lw.type, lw.loaded, (void*)lw.attention_norm,
-                (void*)lw.attn_qkv, (void*)lw.moe_gate,
-                lw.qkv_out_dim, max_qkv_dim);
-        fprintf(stderr, "[nexus] Buffers: hidden=%p residual=%p norm_buf=%p qkv_buf=%p attn_out=%p\n",
-                (void*)hidden_state, (void*)residual, (void*)norm_buf, (void*)qkv_buf, (void*)attn_output);
-    }
-
     switch (lw.type) {
         case HybridLayerType::SSM_MoE:
             execute_ssm_moe_layer(layer_idx, x, seq_pos);
@@ -539,13 +530,8 @@ void HybridModel::Impl::execute_ssm_moe_layer(uint32_t layer_idx, float* x,
     // attn_qkv: [hidden_dim, qkv_out_dim] — single matmul
     int qkv_dim = lw.qkv_out_dim;
     if (lw.attn_qkv && qkv_dim > 0) {
-        fprintf(stderr, "[gemm] A=%p B=%p C=%p M=1 N=%d K=%d\n",
-                (void*)norm_buf, (void*)lw.attn_qkv, (void*)qkv_buf, qkv_dim, dim);
-        fprintf(stderr, "[gemm] A[0]=%f B[0]=%f\n", norm_buf[0], lw.attn_qkv[0]);
-        fflush(stderr);
         compute::global_compute().gemm(norm_buf, lw.attn_qkv, qkv_buf,
                          1, qkv_dim, dim);
-        fprintf(stderr, "[gemm] done, C[0]=%f\n", qkv_buf[0]);
     } else {
         // No QKV weights — zero out and skip attention
         memset(qkv_buf, 0, dim * sizeof(float));

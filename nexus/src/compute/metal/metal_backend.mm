@@ -72,6 +72,11 @@ struct MetalBackendImpl {
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSError* err = cb.error;
+            fprintf(stderr, "[metal] Command buffer error: %s\n",
+                    err ? [[err localizedDescription] UTF8String] : "unknown");
+        }
     }
 };
 

@@ -73,7 +73,8 @@ MetalBackend::buffer_id ComputeDispatch::ensure_buffer(BufferCache& cache, size_
 
 void ComputeDispatch::gemm(const float* A, const float* B, float* C,
                             int M, int N, int K) {
-    if (gpu_ready_ && M * N * K > 1000000) {
+    // Route large matrix ops to GPU. For small element-wise ops, CPU is faster.
+    if (gpu_ready_ && static_cast<int64_t>(N) * K > 100000) {
         // GPU path: upload to shared buffers, dispatch Metal tiled GEMM
         size_t a_size = M * K * sizeof(float);
         size_t b_size = K * N * sizeof(float);
@@ -84,7 +85,6 @@ void ComputeDispatch::gemm(const float* A, const float* B, float* C,
         auto bc = ensure_buffer(buf_c_, c_size);
 
         if (ba && bb && bc) {
-            // UMA zero-copy: memcpy writes directly to GPU-visible memory
             gpu_->copy_to_buffer(ba, A, a_size);
             gpu_->copy_to_buffer(bb, B, b_size);
 
@@ -95,7 +95,13 @@ void ComputeDispatch::gemm(const float* A, const float* B, float* C,
                     memcpy(C, result, c_size);
                     return;
                 }
+                fprintf(stderr, "[compute] GPU GEMM: buffer_contents returned null\n");
+            } else {
+                fprintf(stderr, "[compute] GPU GEMM dispatch failed, falling back to CPU\n");
             }
+        } else {
+            fprintf(stderr, "[compute] GPU buffer alloc failed (need %zu + %zu + %zu bytes)\n",
+                    a_size, b_size, c_size);
         }
         // Fall through to CPU on failure
     }
