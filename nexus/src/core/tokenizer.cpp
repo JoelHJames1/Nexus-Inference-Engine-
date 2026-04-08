@@ -105,18 +105,52 @@ bool Tokenizer::load_from_nxf_manifest(const format::ModelManifest& /*manifest*/
     }
 
     std::string vocab_path = dir + "vocab.txt";
-    if (load_from_vocab_file(vocab_path)) {
-        return true;
+    bool loaded = load_from_vocab_file(vocab_path);
+
+    if (!loaded) {
+        // Also try vocab.txt in parent directory (common layout)
+        std::string parent_vocab = dir + "../vocab.txt";
+        loaded = load_from_vocab_file(parent_vocab);
+        if (loaded) dir = dir + "../";
     }
 
-    // Also try vocab.txt in parent directory (common layout)
-    std::string parent_vocab = dir + "../vocab.txt";
-    if (load_from_vocab_file(parent_vocab)) {
-        return true;
+    if (!loaded) {
+        fprintf(stderr, "[tokenizer] No vocab file found near: %s\n", nxf_path.c_str());
+        return false;
     }
 
-    fprintf(stderr, "[tokenizer] No vocab file found near: %s\n", nxf_path.c_str());
-    return false;
+    // Try to also load BPE merge rules from merges.txt in the same directory.
+    std::string merges_path = dir + "merges.txt";
+    std::ifstream mfs(merges_path, std::ios::binary);
+    if (mfs.is_open()) {
+        std::vector<std::string> merge_lines;
+        std::string line;
+        while (std::getline(mfs, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty()) merge_lines.push_back(std::move(line));
+        }
+        mfs.close();
+
+        if (!merge_lines.empty()) {
+            merges_.clear();
+            merge_priority_.clear();
+            for (size_t i = 0; i < merge_lines.size(); ++i) {
+                size_t sp = merge_lines[i].find(' ');
+                if (sp == std::string::npos || sp == 0 || sp == merge_lines[i].size() - 1)
+                    continue;
+                MergeRule rule;
+                rule.left   = merge_lines[i].substr(0, sp);
+                rule.right  = merge_lines[i].substr(sp + 1);
+                rule.merged = rule.left + rule.right;
+                merge_priority_[rule.left + " " + rule.right] = static_cast<int>(i);
+                merges_.push_back(std::move(rule));
+            }
+            fprintf(stderr, "[tokenizer] Loaded %zu merge rules from: %s\n",
+                    merges_.size(), merges_path.c_str());
+        }
+    }
+
+    return true;
 }
 
 // ─── Build index ──────────────────────────────────────────────────────────
