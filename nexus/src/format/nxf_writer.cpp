@@ -186,8 +186,9 @@ static std::vector<uint8_t> serialize_tensor_index(const std::vector<TensorInfo>
 
 NXFWriter::~NXFWriter() {
     if (fd_ >= 0) {
-        // If finalize() was not called, truncate to avoid a corrupt partial file.
-        ::ftruncate(fd_, 0);
+        // If finalize() was not called, leave the partial file on disk
+        // so the user can inspect what was written. Don't truncate.
+        fprintf(stderr, "[nxf] WARNING: writer destroyed without finalize() — partial file preserved\n");
         ::close(fd_);
         fd_ = -1;
     }

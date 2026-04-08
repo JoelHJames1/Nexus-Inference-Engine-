@@ -95,6 +95,7 @@ add_library(nexus_core STATIC
 
     # Model
     src/model/transformer.cpp
+    src/model/hybrid_model.cpp
     src/model/moe_router.cpp
     src/model/moe_layer.cpp
     src/model/speculative.cpp

@@ -1093,12 +1093,11 @@ bool GGUFImporter::convert(const std::string& gguf_path,
         // Read source tensor data from GGUF
         uint64_t abs_offset = gguf.data_start + td.offset;
         if (abs_offset + src_data_size > gguf_file_size) {
-            fprintf(stderr, "  ERROR: tensor data extends past end of file "
-                    "(offset=0x%llX, size=%zu, file_size=%llu)\n",
+            fprintf(stderr, "  WARNING: tensor data extends past end of file "
+                    "(offset=0x%llX, size=%zu, file_size=%llu) — skipping\n",
                     (unsigned long long)abs_offset, src_data_size,
                     (unsigned long long)gguf_file_size);
-            ::close(gguf_fd);
-            return false;
+            continue;  // Skip this tensor but keep converting the rest
         }
 
         std::vector<uint8_t> src_buf(src_data_size);

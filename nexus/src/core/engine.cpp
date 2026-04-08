@@ -3,18 +3,31 @@
 #include "core/engine.h"
 #include "memory/memory_manager.h"
 #include "model/transformer.h"
+#include "model/hybrid_model.h"
 #include <cstdio>
 #include <chrono>
 #include <thread>
 
 namespace nexus {
 
+/// Returns true if the architecture string indicates a hybrid SSM+Attention model
+/// that should use HybridModel instead of the standard Transformer.
+static bool is_hybrid_architecture(const std::string& arch) {
+    return arch == "qwen3_coder_next"
+        || arch == "qwen3-coder-next"
+        || arch == "Qwen3-Coder-Next"
+        || arch == "hybrid_ssm_attention"
+        || arch == "hybrid_deltanet_moe";
+}
+
 struct Engine::Impl {
     EngineConfig config;
     std::unique_ptr<format::NXFReader> reader;
     std::unique_ptr<MemoryManager> memory;
     std::unique_ptr<model::Transformer> model;
+    std::unique_ptr<model::HybridModel> hybrid_model;
     format::ModelManifest manifest;
+    bool using_hybrid = false;
 };
 
 Engine::~Engine() = default;
@@ -49,15 +62,31 @@ std::unique_ptr<Engine> Engine::create(const std::string& model_path,
     fprintf(stderr, "[nexus] Memory limit: %.1f GB\n",
             config.memory.ram_limit / (1024.0 * 1024.0 * 1024.0));
 
-    // Initialize transformer model
-    engine->impl_->model = model::Transformer::create(
-        engine->impl_->manifest,
-        *engine->impl_->reader,
-        *engine->impl_->memory
-    );
-    if (!engine->impl_->model) {
-        fprintf(stderr, "[nexus] ERROR: Failed to initialize transformer\n");
-        return nullptr;
+    // Initialize model — choose HybridModel for hybrid architectures,
+    // standard Transformer for everything else.
+    if (is_hybrid_architecture(engine->impl_->manifest.architecture)) {
+        fprintf(stderr, "[nexus] Detected hybrid SSM+Attention architecture: %s\n",
+                engine->impl_->manifest.architecture.c_str());
+        engine->impl_->hybrid_model = model::HybridModel::create(
+            engine->impl_->manifest,
+            *engine->impl_->reader,
+            *engine->impl_->memory
+        );
+        if (!engine->impl_->hybrid_model) {
+            fprintf(stderr, "[nexus] ERROR: Failed to initialize hybrid model\n");
+            return nullptr;
+        }
+        engine->impl_->using_hybrid = true;
+    } else {
+        engine->impl_->model = model::Transformer::create(
+            engine->impl_->manifest,
+            *engine->impl_->reader,
+            *engine->impl_->memory
+        );
+        if (!engine->impl_->model) {
+            fprintf(stderr, "[nexus] ERROR: Failed to initialize transformer\n");
+            return nullptr;
+        }
     }
 
     fprintf(stderr, "[nexus] Engine ready.\n");
@@ -67,7 +96,9 @@ std::unique_ptr<Engine> Engine::create(const std::string& model_path,
 std::string Engine::generate(const std::string& prompt,
                               const SamplingParams& params,
                               TokenCallback callback) {
-    if (!impl_ || !impl_->model) return "";
+    if (!impl_) return "";
+    if (!impl_->using_hybrid && !impl_->model) return "";
+    if (impl_->using_hybrid && !impl_->hybrid_model) return "";
 
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -77,7 +108,11 @@ std::string Engine::generate(const std::string& prompt,
 
     // Prefill
     auto prefill_start = std::chrono::high_resolution_clock::now();
-    impl_->model->prefill(tokens);
+    if (impl_->using_hybrid) {
+        impl_->hybrid_model->prefill(tokens);
+    } else {
+        impl_->model->prefill(tokens);
+    }
     auto prefill_end = std::chrono::high_resolution_clock::now();
 
     double prefill_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
@@ -90,7 +125,12 @@ std::string Engine::generate(const std::string& prompt,
     auto decode_start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < params.max_tokens; i++) {
-        int32_t next_token = impl_->model->decode_step(params);
+        int32_t next_token;
+        if (impl_->using_hybrid) {
+            next_token = impl_->hybrid_model->decode_step(params);
+        } else {
+            next_token = impl_->model->decode_step(params);
+        }
 
         // Check for EOS
         if (next_token <= 0) break;
@@ -149,8 +189,12 @@ size_t Engine::memory_usage() const {
 }
 
 void Engine::reset_cache() {
-    if (impl_ && impl_->model) {
-        impl_->model->reset_kv_cache();
+    if (impl_) {
+        if (impl_->using_hybrid && impl_->hybrid_model) {
+            impl_->hybrid_model->reset_kv_cache();
+        } else if (impl_->model) {
+            impl_->model->reset_kv_cache();
+        }
     }
 }
 
