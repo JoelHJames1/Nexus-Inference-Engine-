@@ -141,31 +141,95 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## Compatible Model Formats
 
-| Format | Source | Support | Notes |
-|--------|--------|---------|-------|
-| **GGUF** | llama.cpp | Full | All quantization types (Q4_0, Q4_K_M, Q8_0, F16, etc.) |
-| **Safetensors** | HuggingFace | Full | Single file and multi-shard, with config.json parsing |
-| **NXF** | NEXUS native | Full | Streaming-optimized, per-tensor codec, 16KB page-aligned |
+### Input Formats (for conversion to NXF)
 
-### Supported Architectures
+| Format | Source | Status | Notes |
+|--------|--------|--------|-------|
+| **GGUF** | llama.cpp / ollama | Full support | All quantization types including K-quants |
+| **Safetensors** | HuggingFace | Full support | Single file and multi-shard with config.json |
+| **NXF** | NEXUS native | Native | Streaming-optimized, no conversion needed |
 
-- LLaMA / LLaMA 2 / LLaMA 3 / LLaMA 3.1
-- Mistral / Mixtral (MoE)
-- DeepSeek / DeepSeek-V3 (MoE)
-- Qwen / Qwen2
-- Any transformer-based model in GGUF or safetensors format
+### GGUF Quantization Types Supported
 
-### Quantization Codecs
+| Type | ID | Description | Status |
+|------|----|-------------|--------|
+| F32 | 0 | 32-bit float | Supported |
+| F16 | 1 | 16-bit float | Supported |
+| Q4_0 | 2 | 4-bit (legacy) | Supported |
+| Q4_1 | 3 | 4-bit with min (legacy) | Supported |
+| Q5_0 | 6 | 5-bit (legacy) | Supported |
+| Q5_1 | 7 | 5-bit with min (legacy) | Supported |
+| Q8_0 | 8 | 8-bit | Supported |
+| **Q2_K** | 10 | 2-bit K-quant | **Supported** |
+| **Q3_K** | 11 | 3-bit K-quant (Q3_K_S, Q3_K_M, Q3_K_L) | **Supported** |
+| **Q4_K** | 12 | 4-bit K-quant (Q4_K_S, Q4_K_M) | **Supported** |
+| **Q5_K** | 13 | 5-bit K-quant (Q5_K_S, Q5_K_M) | **Supported** |
+| **Q6_K** | 14 | 6-bit K-quant | **Supported** |
+| BF16 | 30 | Brain float 16 | Supported |
+| IQ types | 16-23 | I-quants | Planned |
 
-| Codec | Bits | Compression | Quality | Use Case |
+### Safetensors Types Supported
+
+| Type | Description | Status |
+|------|-------------|--------|
+| F32 | 32-bit float | Supported |
+| F16 | 16-bit float | Supported |
+| BF16 | Brain float 16 | Supported |
+| I8 | 8-bit integer | Supported |
+| I32 | 32-bit integer | Supported |
+| I64 | 64-bit integer | Supported |
+
+### Supported Model Architectures
+
+| Architecture | Type | Example Models | Tested |
+|-------------|------|---------------|--------|
+| **LLaMA** | Dense | LLaMA 3.1 8B/70B/405B | Yes |
+| **Mistral** | Dense | Mistral 7B, Codestral | Yes |
+| **Mixtral** | MoE | Mixtral 8x7B, 8x22B | Yes |
+| **DeepSeek** | MoE | DeepSeek-V3 671B (37B active) | Yes |
+| **Qwen** | Dense/MoE | Qwen2.5, Qwen3-Coder-Next 80B | Yes |
+| **Phi** | Dense | Phi-3, Phi-4 | Yes |
+| **Gemma** | Dense | Gemma 2, Gemma 4 | Yes |
+| **Command-R** | Dense | Command R+, Command A | Planned |
+| **SSM/Hybrid** | Hybrid | Qwen3-Coder-Next (SSM+MoE+Attention) | Yes |
+
+Any model available in GGUF or safetensors format can be converted to NXF and run with NEXUS.
+
+### NEXUS Native Quantization Codecs (NXF)
+
+| Codec | Bits | Compression | Quality | Best For |
 |-------|------|-------------|---------|----------|
-| FP16 | 16 | 1x | Baseline | Reference / small models |
-| INT8 | 8 | 2x | Near-lossless | When quality matters most |
-| GPTQ (INT4) | 4 | 4x | <1% loss | General purpose |
-| AWQ (INT4) | 4 | 4x | <0.5% loss | Activation-aware, higher quality |
-| QuIP# | 3 | 5.3x | <1% loss | **Recommended** for large models |
-| QuIP# + ANS | ~2.6 | 6.1x | <1% loss | Maximum compression |
-| TurboQuant | 2.5-3.5 | 4.6-6.4x | Quality-neutral | KV cache compression |
+| FP16 | 16 | 1x | Baseline | Reference, small models |
+| FP32 | 32 | 0.5x | Baseline | Debugging |
+| INT8 | 8 | 2x | Near-lossless | Quality-critical applications |
+| GPTQ (INT4) | 4 | 4x | <1% loss | General purpose, broad compatibility |
+| AWQ (INT4) | 4 | 4x | <0.5% loss | Activation-aware, higher quality than GPTQ |
+| **QuIP# (3-bit)** | 3 | 5.3x | <1% loss | **Recommended for large models (70B+)** |
+| **QuIP# + ANS** | ~2.6 | 6.1x | <1% loss | **Maximum weight compression** |
+| **TurboQuant** | 2.5-3.5 | 4.6-6.4x | Quality-neutral at 3.5b | **KV cache compression (automatic)** |
+
+### Where to Find Models
+
+| Source | URL | Format | Notes |
+|--------|-----|--------|-------|
+| HuggingFace Hub | huggingface.co | GGUF, Safetensors | Largest model repository |
+| Unsloth | huggingface.co/unsloth | GGUF | Optimized quants with Dynamic GGUF |
+| bartowski | huggingface.co/bartowski | GGUF | Wide variety of quant levels |
+| LM Studio | huggingface.co/lmstudio-community | GGUF | Tested for local inference |
+| TheBloke | huggingface.co/TheBloke | GGUF | Large collection (older models) |
+
+**Quick download example:**
+```bash
+# Using huggingface CLI
+pip install huggingface-hub
+hf download unsloth/Qwen3-Coder-Next-GGUF Qwen3-Coder-Next-Q3_K_S.gguf --local-dir models/
+
+# Using wget
+wget https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+
+# Then convert to NXF
+./nexus convert models/model.gguf models/model.nxf --codec int4
+```
 
 ## Architecture
 
