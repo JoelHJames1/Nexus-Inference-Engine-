@@ -21,7 +21,7 @@ namespace nexus::import {
 
 // ─── GGUF on-disk constants ────────────────────────────────────────────────
 
-constexpr uint32_t kGGUFMagic   = 0x46475547;  // "GGUF" little-endian
+constexpr uint32_t kGGUFMagic   = 0x46554747;  // "GGUF" as uint32 on little-endian (bytes: 47 47 55 46)
 constexpr uint32_t kGGUFVersion = 3;
 
 /// GGUF tensor type IDs (subset we handle).

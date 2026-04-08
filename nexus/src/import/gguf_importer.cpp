@@ -745,6 +745,213 @@ void dequant_bf16(float* out, const uint16_t* src, size_t num_elements) {
     }
 }
 
+// ─── K-quant dequantizers ────────────────────────────────────────────────────
+// K-quant formats use "super-blocks" of 256 elements with multi-level quantization.
+// Each super-block has scales/mins stored at reduced precision, plus packed quant values.
+
+/// Dequantize Q2_K: 2-bit quantization with 4-bit scales/mins.
+/// Super-block: 256 elements.
+/// Layout: [16 bytes scales (4-bit packed)][16 bytes mins (4-bit packed)][64 bytes quants (2-bit packed)][fp16 dmin][fp16 d] = 84 bytes
+void dequant_q2_k(float* out, const uint8_t* src, size_t num_elements) {
+    const size_t QK = 256;
+    const size_t block_size = 84;
+    size_t num_blocks = num_elements / QK;
+
+    for (size_t b = 0; b < num_blocks; ++b) {
+        const uint8_t* block = src + b * block_size;
+        const uint8_t* scales_buf = block;       // 16 bytes: 16 x 4-bit scales packed as pairs
+        const uint8_t* quants = block + 16;      // 64 bytes: 256 x 2-bit values
+        uint16_t raw_dmin, raw_d;
+        std::memcpy(&raw_dmin, block + 80, 2);
+        std::memcpy(&raw_d, block + 82, 2);
+        float dmin = fp16_to_fp32(raw_dmin);
+        float d    = fp16_to_fp32(raw_d);
+
+        for (int j = 0; j < QK / 16; ++j) {
+            // Each group of 16 elements shares a 4-bit scale and 4-bit min
+            uint8_t sc_byte = scales_buf[j];
+            float scale = d * (sc_byte & 0x0F);
+            float min   = dmin * ((sc_byte >> 4) & 0x0F);
+
+            for (int k = 0; k < 16; ++k) {
+                int idx = j * 16 + k;
+                int byte_idx = idx / 4;
+                int bit_shift = (idx % 4) * 2;
+                int q = (quants[byte_idx] >> bit_shift) & 0x03;
+                out[b * QK + idx] = scale * static_cast<float>(q) - min;
+            }
+        }
+    }
+}
+
+/// Dequantize Q3_K: 3-bit quantization with 6-bit super-block scales.
+/// Super-block: 256 elements, divided into 16 groups of 16.
+/// Layout: [32 bytes hmasks][96 bytes quants (low 2 bits, packed)][12 bytes scales (6-bit packed)][fp16 d] = 110 bytes
+void dequant_q3_k(float* out, const uint8_t* src, size_t num_elements) {
+    const size_t QK = 256;
+    // block_q3_K: 96 bytes qs + 32 bytes hmask + 12 bytes scales + 2 bytes d = 110
+    // But llama.cpp layout is: hmask[32], qs[64], scales[12], d[2] for 256 elements
+    // Actually: struct block_q3_K { uint8_t hmask[QK/8]; uint8_t qs[QK/4]; uint8_t scales[12]; ggml_half d; }
+    // QK/8 = 32, QK/4 = 64, so total = 32 + 64 + 12 + 2 = 110 bytes
+    const size_t block_size = 110;
+    size_t num_blocks = num_elements / QK;
+
+    for (size_t b = 0; b < num_blocks; ++b) {
+        const uint8_t* block = src + b * block_size;
+        const uint8_t* hmask = block;            // 32 bytes: high bit mask
+        const uint8_t* qs    = block + 32;       // 64 bytes: low 2 bits packed (4 per byte)
+        const uint8_t* sc    = block + 96;       // 12 bytes: scales packed
+        uint16_t raw_d;
+        std::memcpy(&raw_d, block + 108, 2);
+        float d = fp16_to_fp32(raw_d);
+
+        // Unpack scales (16 x 6-bit values packed into 12 bytes)
+        int32_t scales[16];
+        for (int i = 0; i < 8; ++i) {
+            scales[i]     = (sc[i] & 0x0F) | (((sc[8 + (i / 2)] >> (4 * (i % 2))) & 3) << 4);
+            scales[i + 8] = (sc[i] >> 4)   | (((sc[8 + (i / 2)] >> (4 * (i % 2) + 2)) & 3) << 4);
+        }
+        // Center around 32: scale = scale - 32
+        for (int i = 0; i < 16; ++i) {
+            scales[i] -= 32;
+        }
+
+        for (int j = 0; j < QK; ++j) {
+            // Low 2 bits from qs
+            int byte_idx = j / 4;
+            int bit_shift = (j % 4) * 2;
+            int q_lo = (qs[byte_idx] >> bit_shift) & 0x03;
+            // High bit from hmask
+            int q_hi = (hmask[j / 8] >> (j % 8)) & 1;
+            int q = q_lo | (q_hi << 2);  // 3-bit value [0..7]
+            // Center: q - 4
+            int group = j / 16;
+            out[b * QK + j] = d * scales[group] * (static_cast<float>(q) - 4.0f);
+        }
+    }
+}
+
+/// Dequantize Q4_K: 4-bit quantization with 6-bit scales/mins.
+/// Super-block: 256 elements.
+/// Layout: fp16 d, fp16 dmin, 12 bytes scales, 128 bytes quants = 144 bytes
+void dequant_q4_k(float* out, const uint8_t* src, size_t num_elements) {
+    const size_t QK = 256;
+    // struct block_q4_K { ggml_half d; ggml_half dmin; uint8_t scales[12]; uint8_t qs[QK/2]; }
+    const size_t block_size = 2 + 2 + 12 + QK / 2;  // 144 bytes
+    size_t num_blocks = num_elements / QK;
+
+    for (size_t b = 0; b < num_blocks; ++b) {
+        const uint8_t* block = src + b * block_size;
+        uint16_t raw_d, raw_dmin;
+        std::memcpy(&raw_d, block, 2);
+        std::memcpy(&raw_dmin, block + 2, 2);
+        float d    = fp16_to_fp32(raw_d);
+        float dmin = fp16_to_fp32(raw_dmin);
+        const uint8_t* sc = block + 4;        // 12 bytes scales
+        const uint8_t* qs = block + 16;       // 128 bytes quants
+
+        // Unpack 8 x (6-bit scale, 6-bit min) from 12 bytes
+        uint8_t scales[8], mins[8];
+        for (int i = 0; i < 4; ++i) {
+            scales[i]     = sc[i] & 0x3F;
+            scales[i + 4] = sc[i + 4] & 0x3F;
+            mins[i]       = sc[i] >> 6 | ((sc[i + 8] & 0x0F) << 2);
+            mins[i + 4]   = sc[i + 4] >> 6 | ((sc[i + 8] >> 4) << 2);
+        }
+
+        for (int j = 0; j < QK / 2; ++j) {
+            uint8_t byte = qs[j];
+            int group_lo = (j * 2) / 32;
+            int group_hi = (j * 2 + 1) / 32;
+            int lo = byte & 0x0F;
+            int hi = byte >> 4;
+            out[b * QK + j * 2]     = d * scales[group_lo] * lo - dmin * mins[group_lo];
+            out[b * QK + j * 2 + 1] = d * scales[group_hi] * hi - dmin * mins[group_hi];
+        }
+    }
+}
+
+/// Dequantize Q5_K: 5-bit quantization.
+/// Super-block: 256 elements.
+/// Layout: fp16 d, fp16 dmin, 12 bytes scales, 128 bytes qs, 32 bytes qh = 176 bytes
+void dequant_q5_k(float* out, const uint8_t* src, size_t num_elements) {
+    const size_t QK = 256;
+    // struct block_q5_K { ggml_half d; ggml_half dmin; uint8_t scales[12]; uint8_t qh[QK/8]; uint8_t qs[QK/2]; }
+    const size_t block_size = 2 + 2 + 12 + QK / 8 + QK / 2;  // 176 bytes
+    size_t num_blocks = num_elements / QK;
+
+    for (size_t b = 0; b < num_blocks; ++b) {
+        const uint8_t* block = src + b * block_size;
+        uint16_t raw_d, raw_dmin;
+        std::memcpy(&raw_d, block, 2);
+        std::memcpy(&raw_dmin, block + 2, 2);
+        float d    = fp16_to_fp32(raw_d);
+        float dmin = fp16_to_fp32(raw_dmin);
+        const uint8_t* sc = block + 4;
+        const uint8_t* qh = block + 16;       // 32 bytes: high bits
+        const uint8_t* qs = block + 48;       // 128 bytes: low 4 bits
+
+        // Unpack scales/mins same as Q4_K
+        uint8_t scales[8], mins[8];
+        for (int i = 0; i < 4; ++i) {
+            scales[i]     = sc[i] & 0x3F;
+            scales[i + 4] = sc[i + 4] & 0x3F;
+            mins[i]       = sc[i] >> 6 | ((sc[i + 8] & 0x0F) << 2);
+            mins[i + 4]   = sc[i + 4] >> 6 | ((sc[i + 8] >> 4) << 2);
+        }
+
+        for (int j = 0; j < QK / 2; ++j) {
+            uint8_t byte = qs[j];
+            int lo = byte & 0x0F;
+            int hi = byte >> 4;
+            // High bit from qh
+            int h_lo = (qh[(j * 2) / 8] >> ((j * 2) % 8)) & 1;
+            int h_hi = (qh[(j * 2 + 1) / 8] >> ((j * 2 + 1) % 8)) & 1;
+            int q_lo = lo | (h_lo << 4);  // 5-bit
+            int q_hi = hi | (h_hi << 4);  // 5-bit
+            int group_lo = (j * 2) / 32;
+            int group_hi = (j * 2 + 1) / 32;
+            out[b * QK + j * 2]     = d * scales[group_lo] * q_lo - dmin * mins[group_lo];
+            out[b * QK + j * 2 + 1] = d * scales[group_hi] * q_hi - dmin * mins[group_hi];
+        }
+    }
+}
+
+/// Dequantize Q6_K: 6-bit quantization.
+/// Super-block: 256 elements.
+/// Layout: 128 bytes ql, 64 bytes qh, 16 bytes scales (int8), fp16 d = 210 bytes
+void dequant_q6_k(float* out, const uint8_t* src, size_t num_elements) {
+    const size_t QK = 256;
+    // struct block_q6_K { uint8_t ql[QK/2]; uint8_t qh[QK/4]; int8_t scales[QK/16]; ggml_half d; }
+    const size_t block_size = QK / 2 + QK / 4 + QK / 16 + 2;  // 210 bytes
+    size_t num_blocks = num_elements / QK;
+
+    for (size_t b = 0; b < num_blocks; ++b) {
+        const uint8_t* block = src + b * block_size;
+        const uint8_t* ql = block;              // 128 bytes: low 4 bits
+        const uint8_t* qh = block + 128;        // 64 bytes: high 2 bits
+        const int8_t* scales = reinterpret_cast<const int8_t*>(block + 192);  // 16 bytes
+        uint16_t raw_d;
+        std::memcpy(&raw_d, block + 208, 2);
+        float d = fp16_to_fp32(raw_d);
+
+        for (int j = 0; j < QK; ++j) {
+            // Low 4 bits from ql (packed 2 per byte)
+            int ql_byte = j / 2;
+            int q_lo = (j % 2 == 0) ? (ql[ql_byte] & 0x0F) : (ql[ql_byte] >> 4);
+            // High 2 bits from qh (packed 4 per byte)
+            int qh_byte = j / 4;
+            int qh_shift = (j % 4) * 2;
+            int q_hi = (qh[qh_byte] >> qh_shift) & 0x03;
+            // 6-bit value
+            int q = q_lo | (q_hi << 4);
+            // Center around 32: q - 32
+            int group = j / 16;
+            out[b * QK + j] = d * scales[group] * (static_cast<float>(q) - 32.0f);
+        }
+    }
+}
+
 /// Dequantize a GGUF tensor's raw data to FP32.
 /// Returns true if dequantization was performed; false if the type is not supported.
 bool dequant_gguf_to_fp32(float* out, const uint8_t* src, GGUFType type, size_t num_elements) {
@@ -766,6 +973,21 @@ bool dequant_gguf_to_fp32(float* out, const uint8_t* src, GGUFType type, size_t 
             return true;
         case GGUFType::Q8_0:
             dequant_q8_0(out, src, num_elements);
+            return true;
+        case GGUFType::Q2_K:
+            dequant_q2_k(out, src, num_elements);
+            return true;
+        case GGUFType::Q3_K:
+            dequant_q3_k(out, src, num_elements);
+            return true;
+        case GGUFType::Q4_K:
+            dequant_q4_k(out, src, num_elements);
+            return true;
+        case GGUFType::Q5_K:
+            dequant_q5_k(out, src, num_elements);
+            return true;
+        case GGUFType::Q6_K:
+            dequant_q6_k(out, src, num_elements);
             return true;
         default:
             // For unsupported quant types, zero-fill and warn.

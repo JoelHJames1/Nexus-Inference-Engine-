@@ -168,9 +168,9 @@ int main(int argc, char** argv) {
     } else if (strcmp(cmd, "info") == 0) {
         return cmd_info(argc - 2, argv + 2);
     } else if (strcmp(cmd, "convert") == 0) {
-        return cmd_convert(argc - 2, argv + 2);
+        return cmd_convert(argc - 1, argv + 1);
     } else if (strcmp(cmd, "serve") == 0) {
-        return cmd_serve(argc - 2, argv + 2);
+        return cmd_serve(argc - 1, argv + 1);
     } else if (strcmp(cmd, "bench") == 0) {
         return cmd_bench(argc - 2, argv + 2);
     } else if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
