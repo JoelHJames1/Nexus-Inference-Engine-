@@ -35,3 +35,6 @@ xcuserdata/
 *.swp
 *.swo
 *~
+turboquant/
+turboquant-mlx/
+turboquant-pytorch/
