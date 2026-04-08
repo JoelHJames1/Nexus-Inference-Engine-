@@ -589,6 +589,40 @@ bool ComputeDispatch::gpu_residual_add(MetalBackend::buffer_id buf_a,
     return gpu_->residual_add(buf_a, buf_b, buf_out, n);
 }
 
+bool ComputeDispatch::fused_ffn(const float* hidden, int dim,
+                                 MetalBackend::buffer_id buf_norm_w,
+                                 MetalBackend::buffer_id buf_w1,
+                                 MetalBackend::buffer_id buf_w3,
+                                 MetalBackend::buffer_id buf_w2,
+                                 int ffn_dim, float eps, float* output) {
+    if (!gpu_ready_ || !gpu_) return false;
+
+    size_t h_size = dim * sizeof(float);
+    size_t o_size = dim * sizeof(float);
+    auto buf_h = ensure_buffer(buf_a_, h_size);
+    auto buf_o = ensure_buffer(buf_c_, o_size);
+    if (!buf_h || !buf_o) return false;
+
+    gpu_->copy_to_buffer(buf_h, hidden, h_size);
+    memset(gpu_->buffer_contents(buf_o), 0, o_size);
+
+    MetalBackend::FusedFFNParams params;
+    params.dim = dim;
+    params.ffn_dim = ffn_dim;
+    params.rms_eps = eps;
+
+    bool ok = gpu_->fused_ffn_int4(buf_h, buf_norm_w, buf_w1, buf_w3, buf_w2,
+                                    buf_o, params);
+    if (ok) {
+        void* result = gpu_->buffer_contents(buf_o);
+        if (result) {
+            memcpy(output, result, o_size);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool ComputeDispatch::gpu_buffer_copy(MetalBackend::buffer_id src,
                                        MetalBackend::buffer_id dst,
                                        size_t bytes) {

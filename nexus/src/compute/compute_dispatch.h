@@ -222,6 +222,16 @@ public:
                           MetalBackend::buffer_id buf_b,
                           MetalBackend::buffer_id buf_out, uint32_t n);
 
+    /// Fused FFN: RMSNorm + W1 + W3 + SiLU + W2 + Residual in ONE GPU dispatch.
+    /// hidden_state is input (and residual source). output gets final result.
+    /// All weight buffers must be pre-cached buffer IDs.
+    bool fused_ffn(const float* hidden, int dim,
+                   MetalBackend::buffer_id buf_norm_w,
+                   MetalBackend::buffer_id buf_w1,
+                   MetalBackend::buffer_id buf_w3,
+                   MetalBackend::buffer_id buf_w2,
+                   int ffn_dim, float eps, float* output);
+
     /// GPU buffer-to-buffer copy (uses blit encoder, works inside token batch).
     /// Correctly ordered with prior compute dispatches.
     bool gpu_buffer_copy(MetalBackend::buffer_id src,

@@ -100,6 +100,21 @@ public:
     bool residual_add(buffer_id buf_a, buffer_id buf_b,
                       buffer_id buf_output, uint32_t n);
 
+    // ─── Fused Kernels (mega-kernels for fewer dispatches) ──────────────
+
+    struct FusedFFNParams {
+        uint32_t dim;
+        uint32_t ffn_dim;
+        float    rms_eps;
+    };
+
+    /// Fused FFN: RMSNorm + W1 + W3 + SiLU*mul + W2 + Residual in ONE dispatch.
+    /// hidden is both input and residual source. output gets the final result.
+    bool fused_ffn_int4(buffer_id buf_hidden, buffer_id buf_norm_w,
+                        buffer_id buf_w1, buffer_id buf_w3, buffer_id buf_w2,
+                        buffer_id buf_output,
+                        const FusedFFNParams& params);
+
     /// GPU buffer-to-buffer copy via blit encoder.
     /// Works correctly inside a persistent batch (inserts a barrier, uses
     /// a blit pass, then resumes the compute encoder).

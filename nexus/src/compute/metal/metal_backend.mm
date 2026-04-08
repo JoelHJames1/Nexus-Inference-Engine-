@@ -602,6 +602,42 @@ bool MetalBackend::attention_gpu(buffer_id buf_q, buffer_id buf_k_cache,
     return true;
 }
 
+// ─── Fused FFN (RMSNorm + W1 + W3 + SiLU + W2 + Residual) ─────────────────
+
+bool MetalBackend::fused_ffn_int4(buffer_id buf_hidden, buffer_id buf_norm_w,
+                                   buffer_id buf_w1, buffer_id buf_w3, buffer_id buf_w2,
+                                   buffer_id buf_output,
+                                   const FusedFFNParams& params)
+{
+    if (!is_ready()) return false;
+
+    id<MTLComputePipelineState> pso = impl_->pipeline("fused_ffn_int4");
+    if (!pso) return false;
+
+    auto [cb, enc] = impl_->begin_compute();
+    if (!enc) return false;
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:handle_to_buffer(buf_hidden) offset:0 atIndex:0];
+    [enc setBuffer:handle_to_buffer(buf_norm_w) offset:0 atIndex:1];
+    [enc setBuffer:handle_to_buffer(buf_w1) offset:0 atIndex:2];
+    [enc setBuffer:handle_to_buffer(buf_w3) offset:0 atIndex:3];
+    [enc setBuffer:handle_to_buffer(buf_w2) offset:0 atIndex:4];
+    [enc setBuffer:handle_to_buffer(buf_output) offset:0 atIndex:5];
+    [enc setBytes:&params length:sizeof(params) atIndex:6];
+
+    // Tile across FFN dim: 256 FFN elements per threadgroup
+    constexpr uint32_t TILE_SIZE = 256;
+    uint32_t num_tiles = (params.ffn_dim + TILE_SIZE - 1) / TILE_SIZE;
+    NSUInteger tg = std::min<NSUInteger>([pso maxTotalThreadsPerThreadgroup], 256);
+    MTLSize threadgroup_size = MTLSizeMake(tg, 1, 1);
+    MTLSize grid_size = MTLSizeMake(num_tiles, 1, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:threadgroup_size];
+
+    impl_->end_compute(cb, enc);
+    return true;
+}
+
 // ─── GPU Buffer Copy (blit encoder) ────────────────────────────────────────
 
 bool MetalBackend::buffer_copy(buffer_id src, buffer_id dst, size_t bytes)

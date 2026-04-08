@@ -1478,14 +1478,19 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
             int ffn = lw.ffn_dim;
             auto& gpu = compute::global_compute();
 
-            // FUSED FFN: 4 GPU dispatches with ONE command buffer commit
-            if (gpu.has_gpu_pool() && lw.ffn_w1_raw.data && lw.ffn_w2_raw.data && lw.ffn_w3_raw.data) {
+            // FUSED FFN MEGA-KERNEL: RMSNorm+W1+W3+SiLU+W2+Residual in ONE dispatch
+            if (gpu.has_gpu() && lw.ffn_w1_raw.data && lw.ffn_w2_raw.data && lw.ffn_w3_raw.data) {
                 auto buf_w1 = gpu.get_cached_buffer(lw.ffn_w1_raw.data);
                 auto buf_w3 = gpu.get_cached_buffer(lw.ffn_w3_raw.data);
                 auto buf_w2 = gpu.get_cached_buffer(lw.ffn_w2_raw.data);
+                // Upload norm weight (cached after first call)
+                auto buf_norm = lw.post_attention_norm ?
+                    gpu.upload_small_buffer(lw.post_attention_norm, dim * sizeof(float)) :
+                    (lw.ffn_norm ? gpu.upload_small_buffer(lw.ffn_norm, dim * sizeof(float)) : 0);
 
-                if (buf_w1 && buf_w2 && buf_w3) {
-                    if (gpu.gpu_ffn_fused(x, dim, buf_w1, buf_w3, buf_w2, ffn, out)) {
+                if (buf_w1 && buf_w2 && buf_w3 && buf_norm) {
+                    if (gpu.fused_ffn(x, dim, buf_norm, buf_w1, buf_w3, buf_w2,
+                                       ffn, manifest.rms_norm_eps, out)) {
                         return;
                     }
                 }

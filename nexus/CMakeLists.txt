@@ -171,6 +171,7 @@ set(METAL_SHADERS
     shaders/gemv_q3k.metal
     shaders/attention_gpu.metal
     shaders/fused_multihead_attention.metal
+    shaders/fused_ffn_int4.metal
 )
 
 set(METAL_AIR_FILES "")
