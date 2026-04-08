@@ -1,0 +1,37 @@
+# Build
+nexus/build/
+*.o
+*.a
+*.dylib
+*.metallib
+*.air
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+.DS_Store
+
+# Models (large files)
+*.nxf
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.onnx
+
+# Temporary
+/tmp/
+*.swp
+*.swo
+*~
