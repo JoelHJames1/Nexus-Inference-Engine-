@@ -1599,17 +1599,28 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
                 }
             }
 
-            // CPU fallback: original path
+            // Individual GEMV path (currently fastest)
             std::vector<float> gate_buf(ffn);
             std::vector<float> up_buf(ffn);
             const float* ffn_input = x;
+
+            static thread_local double ffn_w1_t = 0, ffn_w3_t = 0, ffn_silu_t = 0, ffn_w2_t = 0, ffn_alloc_t = 0;
+            static thread_local int ffn_count = 0;
+            auto ft = [&]() { return std::chrono::duration<double,std::milli>(
+                std::chrono::high_resolution_clock::now().time_since_epoch()).count(); };
+            if (layer_idx == 0) { ffn_w1_t=ffn_w3_t=ffn_silu_t=ffn_w2_t=ffn_alloc_t=0; ffn_count=0; }
+
+            double fa = ft();
             fused_gemm(ffn_input, lw.ffn_w1, lw.ffn_w1_raw, gate_buf.data(), 1, ffn, dim);
+            double fb = ft(); ffn_w1_t += fb - fa;
             fused_gemm(ffn_input, lw.ffn_w3, lw.ffn_w3_raw, up_buf.data(), 1, ffn, dim);
+            double fc = ft(); ffn_w3_t += fc - fb;
 
             // SPARSE ACTIVATION: SiLU + threshold — skip near-zero neurons
             // This zeroes out neurons below threshold. The subsequent w2 GEMM
             // multiplies by zero for those rows = effectively skipping them.
             // Typical sparsity: 50-90% of neurons are near-zero after SiLU.
+            double fd = ft();
             if (neuron_sparsifier) {
                 neuron_sparsifier->apply_sparse_swiglu(gate_buf.data(), up_buf.data(), ffn);
             } else {
@@ -1618,8 +1629,16 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
                     gate_buf[i] = s * up_buf[i];
                 }
             }
+            double fe = ft(); ffn_silu_t += fe - fd;
 
             fused_gemm(gate_buf.data(), lw.ffn_w2, lw.ffn_w2_raw, out, 1, dim, ffn);
+            double ff = ft(); ffn_w2_t += ff - fe;
+
+            ffn_count++;
+            if (layer_idx == manifest.num_layers - 1) {
+                fprintf(stderr, "  [FFN detail] W1=%.1fms W3=%.1fms SiLU=%.1fms W2=%.1fms (60 layers)\n",
+                        ffn_w1_t, ffn_w3_t, ffn_silu_t, ffn_w2_t);
+            }
             return;
         }
         return;
