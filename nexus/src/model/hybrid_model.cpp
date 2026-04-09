@@ -677,14 +677,31 @@ int32_t HybridModel::decode_step(const SamplingParams& params) {
         gpu.begin_token();
     }
 
-    // Stream through all layers — in token-batch mode, begin/end_gpu_batch
-    // are no-ops (the token batch owns the command buffer).
+    // ── FULL DECODE PROFILING ──
+    auto tnow = []() {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    };
+    double dt0 = tnow();
+
+    // Stream through all layers
+    static double batch_overhead = 0;
+    static double layer_compute = 0;
+    batch_overhead = 0; layer_compute = 0;
+
+    double batch_overhead_total = 0;
+    double layer_compute_total = 0;
+
     m.scheduler->execute_layers([&](uint32_t layer_idx) {
         if (!m.resident_mode) m.load_layer_weights(layer_idx);
-        gpu.begin_gpu_batch();
+        double b1 = tnow();
         m.execute_layer(layer_idx, m.hidden_state, m.current_seq_len);
-        gpu.end_gpu_batch();
+        double b2 = tnow();
+        layer_compute_total += (b2 - b1);
     });
+
+    double dt_layers = tnow() - dt0;
+    double dt1 = tnow();
 
     if (use_token_batch) {
         // Output norm on GPU
@@ -732,7 +749,22 @@ int32_t HybridModel::decode_step(const SamplingParams& params) {
         }
     }
 
+    double dt_norm_logits = tnow() - dt1;
+    double dt2 = tnow();
+
     int32_t next_token = m.sample_token(m.logits, params);
+
+    double dt_sample = tnow() - dt2;
+    double dt_total = tnow() - dt0;
+
+    // Print decode breakdown for first few tokens
+    static int decode_profile_count = 0;
+    if (decode_profile_count < 5) {
+        fprintf(stderr, "[DECODE PROFILE] layers=%.1fms norm+logits=%.1fms sample=%.1fms TOTAL=%.1fms (%.1f tok/s)\n",
+                layer_compute_total, dt_norm_logits, dt_sample, dt_total, 1000.0 / dt_total);
+        decode_profile_count++;
+    }
+
     m.current_seq_len++;
 
     // Update sparse activation predictors
@@ -1226,6 +1258,23 @@ attn_moe_cpu_ffn_fallback:
     //  ORIGINAL CPU PATH (non-token-batch mode)
     // ════════════════════════════════════════════════════════════════════
 
+    // Profiling: accumulate per-operation time across all layers
+    static thread_local double t_rmsnorm = 0, t_qkv = 0, t_qknorm = 0;
+    static thread_local double t_attention = 0, t_output_proj = 0;
+    static thread_local double t_residual = 0, t_ffn_norm = 0, t_ffn = 0;
+    static thread_local int profile_layer_count = 0;
+    auto tnow = []() {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    };
+    double t0, t1;
+
+    if (layer_idx == 0) {
+        t_rmsnorm = t_qkv = t_qknorm = t_attention = 0;
+        t_output_proj = t_residual = t_ffn_norm = t_ffn = 0;
+        profile_layer_count = 0;
+    }
+
     // ── Save residual ──
     memcpy(residual, x, dim * sizeof(float));
 
@@ -1252,13 +1301,17 @@ attn_moe_cpu_ffn_fallback:
             // placeholder
         } else {
             // RMSNorm on CPU (fast for small dim, avoids dispatch)
+            t0 = tnow();
             if (lw.attention_norm) {
                 gpu.rmsnorm(norm_buf, x, lw.attention_norm, dim, manifest.rms_norm_eps);
             } else {
                 memcpy(norm_buf, x, dim * sizeof(float));
             }
 
+            t1 = tnow(); t_rmsnorm += t1 - t0;
+
             // Individual GEMVs — each uses gemm_int4 with cached buffers.
+            t0 = tnow();
             // Batching QKV into one commit was tested but SLOWER (3.1 vs 6.7)
             // because upload/download overhead exceeds the commit() savings on UMA.
             if (lw.wq) fused_gemm(norm_buf, lw.wq, lw.wq_raw, q.data(), 1, q_dim, dim);
@@ -1267,7 +1320,10 @@ attn_moe_cpu_ffn_fallback:
         }
     }
 
+    t1 = tnow(); t_qkv += t1 - t0;
+
     // ── Apply Q/K RMSNorm if present ──
+    t0 = tnow();
     if (lw.q_norm) {
         int norm_dim = 256;
         std::string qn_name = layer_tensor_name(layer_idx, "attn_q_norm.weight");
@@ -1302,13 +1358,13 @@ attn_moe_cpu_ffn_fallback:
         int head_dim = (n_kv_heads > 0) ? (k_dim / n_kv_heads) : manifest.head_dim;
         int attn_head_dim = head_dim;
 
+        t1 = tnow(); t_qknorm += t1 - t0;
+        t0 = tnow();
+
         if (attn_head_dim > 0 && n_heads > 0 && n_kv_heads > 0) {
             int head_dim_q_actual = (n_heads > 0) ? (q_dim / n_heads) : q_dim;
             int out_attn_dim = n_heads * attn_head_dim;
-            auto& gpu = compute::global_compute();
 
-            // CPU attention (2.7 tok/s) — fused GPU attention needs pre-allocated
-            // KV buffers to avoid per-call alloc overhead. TODO: pre-alloc KV on GPU.
             gqa_attention(q.data(), q_dim, k.data(), v.data(), k_dim,
                           kv, seq_pos, n_heads, n_kv_heads, attn_head_dim,
                           attn_output);
@@ -1320,7 +1376,10 @@ attn_moe_cpu_ffn_fallback:
             }
         }
 
+        t1 = tnow(); t_attention += t1 - t0;
+
         // ── Output projection ──
+        t0 = tnow();
         if (lw.wo) {
             int wo_in_dim = n_heads * head_dim;
             if (wo_in_dim <= 0) wo_in_dim = q_dim;
@@ -1335,27 +1394,51 @@ attn_moe_cpu_ffn_fallback:
         }
     }
 
+    t1 = tnow(); t_output_proj += t1 - t0;
+
     // ── Residual connection after attention ──
+    t0 = tnow();
     for (int i = 0; i < dim; i++) {
         x[i] = residual[i] + attn_output[i];
     }
-
-    // ── Save residual for post-FFN ──
     memcpy(residual, x, dim * sizeof(float));
+    t1 = tnow(); t_residual += t1 - t0;
 
     // ── Post-attention RMSNorm ──
+    t0 = tnow();
     if (lw.post_attention_norm) {
         compute::global_compute().rmsnorm(norm_buf, x, lw.post_attention_norm, dim, manifest.rms_norm_eps);
     } else {
         memcpy(norm_buf, x, dim * sizeof(float));
     }
+    t1 = tnow(); t_ffn_norm += t1 - t0;
 
     // ── MoE FFN ──
+    t0 = tnow();
     moe_ffn(layer_idx, norm_buf, ffn_output);
+
+    t1 = tnow(); t_ffn += t1 - t0;
 
     // ── Residual connection after FFN ──
     for (int i = 0; i < dim; i++) {
         x[i] = residual[i] + ffn_output[i];
+    }
+
+    profile_layer_count++;
+    if (layer_idx == manifest.num_layers - 1) {
+        double total = t_rmsnorm + t_qkv + t_qknorm + t_attention +
+                       t_output_proj + t_residual + t_ffn_norm + t_ffn;
+        fprintf(stderr, "\n=== LAYER PROFILE (%d layers) ===\n", profile_layer_count);
+        fprintf(stderr, "  RMSNorm (pre-attn): %6.1f ms (%4.1f%%)\n", t_rmsnorm, t_rmsnorm/total*100);
+        fprintf(stderr, "  QKV projections:    %6.1f ms (%4.1f%%)\n", t_qkv, t_qkv/total*100);
+        fprintf(stderr, "  Q/K norms:          %6.1f ms (%4.1f%%)\n", t_qknorm, t_qknorm/total*100);
+        fprintf(stderr, "  Attention (CPU):    %6.1f ms (%4.1f%%)\n", t_attention, t_attention/total*100);
+        fprintf(stderr, "  Output projection:  %6.1f ms (%4.1f%%)\n", t_output_proj, t_output_proj/total*100);
+        fprintf(stderr, "  Residual + copy:    %6.1f ms (%4.1f%%)\n", t_residual, t_residual/total*100);
+        fprintf(stderr, "  RMSNorm (pre-FFN):  %6.1f ms (%4.1f%%)\n", t_ffn_norm, t_ffn_norm/total*100);
+        fprintf(stderr, "  FFN (fused):        %6.1f ms (%4.1f%%)\n", t_ffn, t_ffn/total*100);
+        fprintf(stderr, "  TOTAL:              %6.1f ms\n", total);
+        fprintf(stderr, "================================\n\n");
     }
 }
 
@@ -1496,8 +1579,10 @@ void HybridModel::Impl::moe_ffn(uint32_t layer_idx, const float* x, float* out) 
             int ffn = lw.ffn_dim;
             auto& gpu = compute::global_compute();
 
-            // FUSED FFN MEGA-KERNEL: RMSNorm+W1+W3+SiLU+W2+Residual in ONE dispatch
-            if (gpu.has_gpu() && lw.ffn_w1_raw.data && lw.ffn_w2_raw.data && lw.ffn_w3_raw.data) {
+            // FUSED FFN MEGA-KERNEL: disabled for profiling — testing if individual
+            // gemm_int4 calls are faster than fused kernel (each commits separately
+            // but for smaller weight matrices vs one commit for huge fused kernel)
+            if (false && gpu.has_gpu() && lw.ffn_w1_raw.data && lw.ffn_w2_raw.data && lw.ffn_w3_raw.data) {
                 auto buf_w1 = gpu.get_cached_buffer(lw.ffn_w1_raw.data);
                 auto buf_w3 = gpu.get_cached_buffer(lw.ffn_w3_raw.data);
                 auto buf_w2 = gpu.get_cached_buffer(lw.ffn_w2_raw.data);
