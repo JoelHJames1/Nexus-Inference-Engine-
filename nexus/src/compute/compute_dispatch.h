@@ -272,6 +272,10 @@ public:
     /// Get a cached wrapped buffer ID for a raw pointer. Returns 0 if not cached.
     MetalBackend::buffer_id get_cached_buffer(const void* ptr) const;
 
+    /// Get raw CPU pointer for a GPU buffer (UMA = direct access, no copy).
+    void* buffer_contents_raw(MetalBackend::buffer_id buf);
+
+
     /// Pre-allocate the activation buffer to the maximum size needed.
     /// In resident mode this avoids reallocation on the per-token path.
     void pre_allocate_activation_buffer(size_t max_act_bytes, size_t max_out_bytes);

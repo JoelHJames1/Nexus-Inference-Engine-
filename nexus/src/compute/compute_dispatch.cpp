@@ -735,6 +735,11 @@ MetalBackend::buffer_id ComputeDispatch::get_cached_buffer(const void* ptr) cons
     return (it != wrapped_buffer_cache_.end()) ? it->second : 0;
 }
 
+void* ComputeDispatch::buffer_contents_raw(MetalBackend::buffer_id buf) {
+    if (!gpu_ready_ || !gpu_ || !buf) return nullptr;
+    return gpu_->buffer_contents(buf);
+}
+
 // ─── Element-wise ops ───────────────────────────────────────────────────────
 
 void ComputeDispatch::rmsnorm(float* out, const float* x, const float* weight,
